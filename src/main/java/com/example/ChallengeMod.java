@@ -1,5 +1,6 @@
 package com.example;
 
+import com.example.antitower.AntiTowerHandler;
 import net.fabricmc.api.ModInitializer;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -32,6 +33,10 @@ public class ChallengeMod implements ModInitializer {
 	private static volatile boolean pendingLock;
 	private static volatile double speedMultiplier = 1.0D;
 	private static volatile boolean benchmarkOverride = false;
+
+	// Anti-Tower settings
+	private static volatile boolean antiTowerEnabled = true;
+	private static volatile double antiTowerDelay = 3.0D; // seconds before tower blocks are destroyed
 
 	// TPS tracking
 	private static final int TPS_SAMPLE_SIZE = 20;
@@ -79,6 +84,23 @@ public class ChallengeMod implements ModInitializer {
 		return currentTps;
 	}
 
+	// Anti-Tower getters and setters
+	public static boolean isAntiTowerEnabled() {
+		return antiTowerEnabled;
+	}
+
+	public static void setAntiTowerEnabled(boolean enabled) {
+		antiTowerEnabled = enabled;
+	}
+
+	public static double getAntiTowerDelay() {
+		return antiTowerDelay;
+	}
+
+	public static void setAntiTowerDelay(double delay) {
+		antiTowerDelay = Math.max(0.5, Math.min(30.0, delay)); // Clamp between 0.5 and 30 seconds
+	}
+
 	@Override
 	public void onInitialize() {
 		// This code runs as soon as Minecraft is in a mod-load-ready state.
@@ -86,6 +108,9 @@ public class ChallengeMod implements ModInitializer {
 		// Proceed with mild caution.
 
 		LOGGER.info("ChallengeMod initialized");
+
+		// Register anti-tower handler
+		AntiTowerHandler.register();
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
 			dispatcher.register(Commands.literal("fasttarget")
