@@ -85,7 +85,7 @@ public class MobBreakerHandler {
             blockDamage.remove(pos);
             level.destroyBlockProgress(breakId, pos, -1);
             String name = breaker != null ? breaker.getType().toShortString() : "unknown";
-            ChallengeMod.LOGGER.info("[MobBreaker] {} broke block at {}", name, pos);
+            // ChallengeMod.LOGGER.info("[MobBreaker] {} broke block at {}", name, pos);
         } else {
             level.destroyBlockProgress(breakId, pos, progressStage);
         }

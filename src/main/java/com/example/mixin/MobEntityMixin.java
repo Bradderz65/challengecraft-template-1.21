@@ -41,7 +41,7 @@ public abstract class MobEntityMixin {
 	private void challengemod$registerFollowRange(CallbackInfo info) {
 		Mob mob = (Mob) (Object) this;
 		boolean eligible = HuntRules.isEligibleMob(mob);
-		ChallengeMod.LOGGER.info("[HuntDebug] registerGoals {} eligible={}", mob.getType().toShortString(), eligible);
+		// registerGoals log removed
 		if (!eligible) {
 			return;
 		}
@@ -90,7 +90,7 @@ public abstract class MobEntityMixin {
 		}
 
 		if (target == null) {
-			debugLog(mob, "aiStep target=none");
+			// debugLog(mob, "aiStep target=none");
 			return;
 		}
 
@@ -103,7 +103,8 @@ public abstract class MobEntityMixin {
 		}
 		if (speed > 4.0D && trySnapTowardTarget(mob, target, speed)) {
 			tryPassiveMelee(mob, target);
-			debugLog(mob, "aiStep target=" + target.getName().getString() + " snap=true");
+			// debugLog(mob, "aiStep target=" + target.getName().getString() + "
+			// snap=true");
 			return;
 		}
 		mob.getNavigation().moveTo(target, speed);
@@ -176,7 +177,7 @@ public abstract class MobEntityMixin {
 			}
 		}
 
-		debugLog(mob, "aiStep target=" + target.getName().getString());
+		// debugLog(mob, "aiStep target=" + target.getName().getString());
 	}
 
 	@Unique

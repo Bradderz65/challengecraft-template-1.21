@@ -11,7 +11,7 @@ import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 
 public final class HuntRules {
-	public static final double HUNT_RANGE = 200.0D;
+	public static final double HUNT_RANGE = 50.0D;
 	public static final double HUNT_RANGE_SQUARED = HUNT_RANGE * HUNT_RANGE;
 
 	private HuntRules() {
