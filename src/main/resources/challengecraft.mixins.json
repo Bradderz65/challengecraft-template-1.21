@@ -4,7 +4,9 @@
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
 		"MobEntityMixin",
-		"BlockItemMixin"
+		"BlockItemMixin",
+		"ProjectileMixin",
+		"RangedBowAttackGoalMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

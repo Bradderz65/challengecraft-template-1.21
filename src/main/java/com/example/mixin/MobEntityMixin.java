@@ -108,8 +108,75 @@ public abstract class MobEntityMixin {
 		}
 		mob.getNavigation().moveTo(target, speed);
 		tryPassiveMelee(mob, target);
-		debugLog(mob, "aiStep target=" + target.getName().getString());
 
+		com.example.antitower.MobBreakerHandler.handleMobBreaking(mob, target);
+
+		// Spider-like climbing: if blocked by wall and target is above, climb up
+		if (mob.horizontalCollision && target.getY() > mob.getY() + 0.5) {
+			Vec3 motion = mob.getDeltaMovement();
+			if (motion.y < 0.2) {
+				mob.setDeltaMovement(new Vec3(motion.x, 0.2, motion.z));
+				mob.fallDistance = 0.0F;
+
+				// Help them latch onto ledges
+				if (mob.onGround()) {
+					mob.getJumpControl().jump();
+				}
+			}
+		}
+
+		// Ceiling Breaker: If climbing but hitting head (vertical collision up), ensure
+		// we break the block above
+		if (mob.verticalCollision && target.getY() > mob.getY() + 2.0) {
+			// Trigger breaker handler for blocks directly above
+			BlockPos headerPos = mob.blockPosition().above(2);
+			if (mob.level().getBlockState(headerPos).getDestroySpeed(mob.level(), headerPos) >= 0) {
+				com.example.antitower.MobBreakerHandler.damageBlock(
+						(net.minecraft.server.level.ServerLevel) mob.level(), headerPos, mob,
+						mob.level().getBlockState(headerPos).getDestroySpeed(mob.level(), headerPos));
+			}
+		}
+
+		// Anti-Clumping / Pillar Chasing Logic / Smart Siege
+		// Radius increased to 30 blocks to allow mobs to find path to pillars from afar
+		double verticalDiff = target.getY() - mob.getY();
+		double horizontalDistSqr = mob.distanceToSqr(target.getX(), mob.getY(), target.getZ());
+
+		if (verticalDiff > 2.0 && horizontalDistSqr < 900.0) { // 30 block radius
+			// If we are close to the pillar base (< 15 blocks away)
+			if (horizontalDistSqr < 225.0) {
+				// SWARM / ORBIT LOGIC
+				// Instead of standing directly below, we make them "orbit" or patrol around the
+				// base of the tower.
+				// This helps them find different sides to climb and prevents stacking in one
+				// spot.
+
+				// Calculate a moving point around the player based on time and mob ID (so they
+				// don't sync up)
+				double time = (mob.tickCount + mob.getId()) * 0.05; // Slower rotation speed
+
+				// Wide Orbit: Oscillate distance between 0.5 (touching) and 14 blocks
+				// This causes them to spiral in and out, covering a large area around the tower
+				double radius = 0.5 + Math.abs(Math.sin(time * 0.3)) * 13.5;
+
+				double siegeX = target.getX() + Math.cos(time) * radius;
+				double siegeZ = target.getZ() + Math.sin(time) * radius;
+
+				// Move towards this orbiting point
+				mob.getMoveControl().setWantedPosition(siegeX, target.getY(), siegeZ, speed);
+
+				// Jump if hitting the wall to start climbing
+				if (mob.horizontalCollision && mob.onGround()) {
+					mob.getJumpControl().jump();
+				}
+			} else if (mob.tickCount % 10 == 0 && (mob.getNavigation().isDone() || mob.getNavigation().isStuck())) {
+				// If we are far and pathfinding failed (likely because target is unreachable),
+				// try to move to the spot on the ground directly below the target.
+				mob.getNavigation().moveTo(target.getX(), mob.getY(), target.getZ(), speed);
+			}
+		}
+
+		debugLog(mob, "aiStep target=" + target.getName().getString());
 	}
 
 	@Unique

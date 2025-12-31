@@ -216,6 +216,8 @@ public class ChallengeMod implements ModInitializer {
 		pendingLock = false;
 		challengeActive = false;
 		challengeLocked = false;
+		AntiTowerHandler.clearAll();
+		com.example.antitower.MobBreakerHandler.clearAll();
 	}
 
 	private static int setSpeedMultiplier(CommandSourceStack source, double multiplier) {
