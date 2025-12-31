@@ -47,8 +47,8 @@ public abstract class MobEntityMixin {
 		}
 
 		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
-		if (followRange != null && followRange.getBaseValue() < HuntRules.HUNT_RANGE) {
-			followRange.setBaseValue(HuntRules.HUNT_RANGE);
+		if (followRange != null && followRange.getBaseValue() < HuntRules.getHuntRange()) {
+			followRange.setBaseValue(HuntRules.getHuntRange());
 		}
 		this.huntRangeSet = true;
 	}
@@ -79,7 +79,7 @@ public abstract class MobEntityMixin {
 		Player target = null;
 		if (mob.getTarget() instanceof Player currentTarget
 				&& HuntRules.isValidPlayerTarget(currentTarget)
-				&& mob.distanceToSqr(currentTarget) <= HuntRules.HUNT_RANGE_SQUARED) {
+				&& mob.distanceToSqr(currentTarget) <= HuntRules.getHuntRangeSquared()) {
 			target = currentTarget;
 		}
 
@@ -107,7 +107,20 @@ public abstract class MobEntityMixin {
 			// snap=true");
 			return;
 		}
-		mob.getNavigation().moveTo(target, speed);
+
+		// Calculate potential patrol conditions first
+		boolean isSiegeMode = false;
+		double verticalDiff = target.getY() - mob.getY();
+		double horizontalDistSqr = mob.distanceToSqr(target.getX(), mob.getY(), target.getZ());
+
+		if (verticalDiff > 2.0 && horizontalDistSqr < 400.0) {
+			isSiegeMode = true;
+		}
+
+		if (!isSiegeMode) {
+			mob.getNavigation().moveTo(target, speed);
+		}
+
 		tryPassiveMelee(mob, target);
 
 		com.example.antitower.MobBreakerHandler.handleMobBreaking(mob, target);
@@ -139,41 +152,47 @@ public abstract class MobEntityMixin {
 		}
 
 		// Anti-Clumping / Pillar Chasing Logic / Smart Siege
-		// Radius increased to 30 blocks to allow mobs to find path to pillars from afar
-		double verticalDiff = target.getY() - mob.getY();
-		double horizontalDistSqr = mob.distanceToSqr(target.getX(), mob.getY(), target.getZ());
+		// Radius increased to allow mobs to find path to pillars from afar
+		// Note: Variables verticalDiff and horizontalDistSqr are calculated above
+		verticalDiff = target.getY() - mob.getY();
+		horizontalDistSqr = mob.distanceToSqr(target.getX(), mob.getY(), target.getZ());
 
-		if (verticalDiff > 2.0 && horizontalDistSqr < 900.0) { // 30 block radius
-			// If we are close to the pillar base (< 15 blocks away)
-			if (horizontalDistSqr < 225.0) {
-				// SWARM / ORBIT LOGIC
-				// Instead of standing directly below, we make them "orbit" or patrol around the
-				// base of the tower.
-				// This helps them find different sides to climb and prevents stacking in one
-				// spot.
+		if (verticalDiff > 2.0) {
+			// If we are somewhat close to the tower base (within 20 blocks)
+			if (horizontalDistSqr < 400.0) {
+				// PATROL LOGIC
+				// Instead of being magnetically pulled to an orbit, pick random spots near the
+				// tower base.
+				// This allows natural exploration using standard pathfinding.
 
-				// Calculate a moving point around the player based on time and mob ID (so they
-				// don't sync up)
-				double time = (mob.tickCount + mob.getId()) * 0.05; // Slower rotation speed
+				if (mob.getNavigation().isDone() || mob.getNavigation().isStuck() || mob.tickCount % 40 == 0) {
+					// 30% chance to charge the center (try to climb)
+					// 70% chance to wander to a random spot around the base
+					if (mob.getRandom().nextFloat() < 0.3f) {
+						// Charge center
+						mob.getNavigation().moveTo(target.getX(), mob.getY(), target.getZ(), speed);
+						mob.getLookControl().setLookAt(target.getX(), mob.getEyeY(), target.getZ());
+					} else {
+						// Pick random spot 2-10 blocks away from center
+						double angle = mob.getRandom().nextDouble() * Math.PI * 2;
+						double dist = 2.0 + mob.getRandom().nextDouble() * 8.0;
+						double destX = target.getX() + Math.cos(angle) * dist;
+						double destZ = target.getZ() + Math.sin(angle) * dist;
 
-				// Wide Orbit: Oscillate distance between 0.5 (touching) and 14 blocks
-				// This causes them to spiral in and out, covering a large area around the tower
-				double radius = 0.5 + Math.abs(Math.sin(time * 0.3)) * 13.5;
+						mob.getNavigation().moveTo(destX, mob.getY(), destZ, speed);
+						mob.getLookControl().setLookAt(destX, mob.getEyeY(), destZ);
+					}
+				}
 
-				double siegeX = target.getX() + Math.cos(time) * radius;
-				double siegeZ = target.getZ() + Math.sin(time) * radius;
-
-				// Move towards this orbiting point
-				mob.getMoveControl().setWantedPosition(siegeX, target.getY(), siegeZ, speed);
-
-				// Jump if hitting the wall to start climbing
+				// Keep climbing logic
 				if (mob.horizontalCollision && mob.onGround()) {
 					mob.getJumpControl().jump();
 				}
-			} else if (mob.tickCount % 10 == 0 && (mob.getNavigation().isDone() || mob.getNavigation().isStuck())) {
-				// If we are far and pathfinding failed (likely because target is unreachable),
-				// try to move to the spot on the ground directly below the target.
-				mob.getNavigation().moveTo(target.getX(), mob.getY(), target.getZ(), speed);
+			} else if (horizontalDistSqr < 900.0) {
+				// If further away (20-30 blocks), try to get to the base
+				if (mob.tickCount % 20 == 0) {
+					mob.getNavigation().moveTo(target.getX(), mob.getY(), target.getZ(), speed);
+				}
 			}
 		}
 
@@ -200,15 +219,34 @@ public abstract class MobEntityMixin {
 		if (!mob.level().noCollision(mob, mob.getBoundingBox().move(step))) {
 			return false;
 		}
-		mob.moveTo(nextPos.x, nextPos.y, nextPos.z, mob.getYRot(), mob.getXRot());
+		// Calculate rotation to face movement
+		double dX = nextPos.x - mob.getX();
+		double dZ = nextPos.z - mob.getZ();
+		if (dX * dX + dZ * dZ > 1.0E-7D) {
+			float targetYRot = (float) (Math.atan2(dZ, dX) * (double) (180F / (float) Math.PI)) - 90.0F;
+
+			// Smooth rotation to prevent jitter
+			float currentYRot = mob.getYRot();
+			float newYRot = currentYRot + net.minecraft.util.Mth.wrapDegrees(targetYRot - currentYRot) * 0.3f; // 30%
+																												// turn
+																												// per
+																												// tick
+
+			float xRot = mob.getXRot();
+			mob.moveTo(nextPos.x, nextPos.y, nextPos.z, newYRot, xRot);
+			mob.setYBodyRot(newYRot);
+			mob.setYHeadRot(newYRot);
+		} else {
+			mob.moveTo(nextPos.x, nextPos.y, nextPos.z, mob.getYRot(), mob.getXRot());
+		}
 		return true;
 	}
 
 	@Unique
 	private void ensureHuntRange(Mob mob) {
 		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
-		if (followRange != null && followRange.getBaseValue() < HuntRules.HUNT_RANGE) {
-			followRange.setBaseValue(HuntRules.HUNT_RANGE);
+		if (followRange != null && followRange.getBaseValue() < HuntRules.getHuntRange()) {
+			followRange.setBaseValue(HuntRules.getHuntRange());
 		}
 	}
 

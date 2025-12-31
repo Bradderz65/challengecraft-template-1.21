@@ -25,6 +25,7 @@ public class ModConfigScreen extends Screen {
     private double speedMultiplier;
     private boolean antiTowerEnabled;
     private double antiTowerDelay;
+    private double huntRange;
 
     // UI components
     private Button challengeToggleButton;
@@ -45,6 +46,7 @@ public class ModConfigScreen extends Screen {
         this.speedMultiplier = ModConfig.getSpeedMultiplier();
         this.antiTowerEnabled = ModConfig.isAntiTowerEnabled();
         this.antiTowerDelay = ModConfig.getAntiTowerDelay();
+        this.huntRange = ModConfig.getHuntRange();
     }
 
     @Override
@@ -52,7 +54,7 @@ public class ModConfigScreen extends Screen {
         super.init();
 
         int centerX = this.width / 2;
-        int startY = this.height / 2 - 90;
+        int startY = this.height / 2 - 110;
         int buttonWidth = PANEL_WIDTH - 20;
 
         // Challenge Active Toggle
@@ -149,6 +151,27 @@ public class ModConfigScreen extends Screen {
 
         updateDelayButtonsState();
 
+        startY += BUTTON_HEIGHT + BUTTON_SPACING + 10;
+
+        // Hunt Range Controls
+        this.addRenderableWidget(Button.builder(
+                Component.literal("-"),
+                button -> {
+                    this.huntRange = Math.max(10.0, this.huntRange - 10.0);
+                })
+                .bounds(centerX - buttonWidth / 2, startY, controlButtonWidth, BUTTON_HEIGHT)
+                .tooltip(Tooltip.create(Component.literal("Decrease detection range")))
+                .build());
+
+        this.addRenderableWidget(Button.builder(
+                Component.literal("+"),
+                button -> {
+                    this.huntRange = Math.min(500.0, this.huntRange + 10.0);
+                })
+                .bounds(centerX + buttonWidth / 2 - controlButtonWidth, startY, controlButtonWidth, BUTTON_HEIGHT)
+                .tooltip(Tooltip.create(Component.literal("Increase detection range")))
+                .build());
+
         startY += BUTTON_HEIGHT + BUTTON_SPACING + 18;
 
         // Done Button
@@ -175,8 +198,8 @@ public class ModConfigScreen extends Screen {
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         int centerX = this.width / 2;
         int panelX = centerX - PANEL_WIDTH / 2;
-        int panelY = this.height / 2 - 110;
-        int panelHeight = 240;
+        int panelY = this.height / 2 - 130;
+        int panelHeight = 270;
 
         // Draw semi-transparent panel background
         graphics.fill(panelX, panelY, panelX + PANEL_WIDTH, panelY + panelHeight, 0xCC1a1a2e);
@@ -212,6 +235,11 @@ public class ModConfigScreen extends Screen {
         }
         graphics.drawCenteredString(this.font, Component.literal(delayText), centerX, delayY + 6, 0xFFFFFFFF);
 
+        // Draw Hunt Range Value
+        int huntRangeY = delayY + BUTTON_HEIGHT + BUTTON_SPACING + 16;
+        String huntRangeText = String.format("Detection Range: %.0f blocks", this.huntRange);
+        graphics.drawCenteredString(this.font, Component.literal(huntRangeText), centerX, huntRangeY + 6, 0xFFFFFFFF);
+
         // Render all widgets
         super.render(graphics, mouseX, mouseY, partialTick);
     }
@@ -224,6 +252,7 @@ public class ModConfigScreen extends Screen {
         ModConfig.setSpeedMultiplier(this.speedMultiplier);
         ModConfig.setAntiTowerEnabled(this.antiTowerEnabled);
         ModConfig.setAntiTowerDelay(this.antiTowerDelay);
+        ModConfig.setHuntRange(this.huntRange);
         ModConfig.save();
 
         // Return to parent screen

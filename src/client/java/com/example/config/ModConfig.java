@@ -31,6 +31,9 @@ public class ModConfig {
         // Anti-Tower settings
         boolean antiTowerEnabled = true;
         double antiTowerDelay = 3.0; // seconds
+
+        // Hunt settings
+        double huntRange = 50.0;
     }
 
     /**
@@ -67,6 +70,7 @@ public class ModConfig {
         ChallengeMod.setSpeedMultiplier(data.speedMultiplier);
         ChallengeMod.setAntiTowerEnabled(data.antiTowerEnabled);
         ChallengeMod.setAntiTowerDelay(data.antiTowerDelay);
+        ChallengeMod.setHuntRange(data.huntRange);
     }
 
     /**
@@ -112,6 +116,10 @@ public class ModConfig {
         return data.antiTowerDelay;
     }
 
+    public static double getHuntRange() {
+        return data.huntRange;
+    }
+
     // ========== Setters ==========
 
     public static void setChallengeActive(boolean active) {
@@ -132,5 +140,9 @@ public class ModConfig {
 
     public static void setAntiTowerDelay(double delay) {
         data.antiTowerDelay = Math.max(0.5, Math.min(30.0, delay));
+    }
+
+    public static void setHuntRange(double range) {
+        data.huntRange = Math.max(10.0, Math.min(500.0, range));
     }
 }

@@ -38,6 +38,9 @@ public class ChallengeMod implements ModInitializer {
 	private static volatile boolean antiTowerEnabled = true;
 	private static volatile double antiTowerDelay = 3.0D; // seconds before tower blocks are destroyed
 
+	// Hunt settings
+	private static volatile double huntRange = 50.0D;
+
 	// TPS tracking
 	private static final int TPS_SAMPLE_SIZE = 20;
 	private static final long[] tickTimes = new long[TPS_SAMPLE_SIZE];
@@ -99,6 +102,14 @@ public class ChallengeMod implements ModInitializer {
 
 	public static void setAntiTowerDelay(double delay) {
 		antiTowerDelay = Math.max(0.5, Math.min(30.0, delay)); // Clamp between 0.5 and 30 seconds
+	}
+
+	public static double getHuntRange() {
+		return huntRange;
+	}
+
+	public static void setHuntRange(double range) {
+		huntRange = Math.max(10.0, Math.min(500.0, range)); // Clamp between 10 and 500
 	}
 
 	@Override

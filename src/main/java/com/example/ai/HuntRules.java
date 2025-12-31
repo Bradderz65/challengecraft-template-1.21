@@ -11,8 +11,13 @@ import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 
 public final class HuntRules {
-	public static final double HUNT_RANGE = 50.0D;
-	public static final double HUNT_RANGE_SQUARED = HUNT_RANGE * HUNT_RANGE;
+	public static double getHuntRange() {
+		return com.example.ChallengeMod.getHuntRange();
+	}
+
+	public static double getHuntRangeSquared() {
+		return getHuntRange() * getHuntRange();
+	}
 
 	private HuntRules() {
 	}
@@ -42,18 +47,17 @@ public final class HuntRules {
 
 	public static Player findClosestTarget(Mob mob) {
 		Player closest = null;
-		double closestDistance = HUNT_RANGE_SQUARED;
+		double closestDistance = getHuntRangeSquared();
 		for (Player player : mob.level().players()) {
 			if (!isValidPlayerTarget(player)) {
 				continue;
 			}
 			double distance = mob.distanceToSqr(player);
-			if (distance <= HUNT_RANGE_SQUARED && distance < closestDistance) {
+			if (distance <= getHuntRangeSquared() && distance < closestDistance) {
 				closest = player;
 				closestDistance = distance;
 			}
 		}
 		return closest;
 	}
-
 }
