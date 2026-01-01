@@ -108,6 +108,9 @@ public abstract class MobEntityMixin {
 			return;
 		}
 
+		// Try A* pathfinding if enabled
+		boolean usingAStar = com.example.ai.MobPathManager.updatePathfinding(mob, target);
+
 		// Calculate potential patrol conditions first
 		boolean isSiegeMode = false;
 		double verticalDiff = target.getY() - mob.getY();
@@ -117,7 +120,8 @@ public abstract class MobEntityMixin {
 			isSiegeMode = true;
 		}
 
-		if (!isSiegeMode) {
+		// Only use vanilla navigation if A* is not active and not in siege mode
+		if (!usingAStar && !isSiegeMode) {
 			mob.getNavigation().moveTo(target, speed);
 		}
 

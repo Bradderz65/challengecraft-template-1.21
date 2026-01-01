@@ -41,6 +41,10 @@ public class ChallengeMod implements ModInitializer {
 	// Hunt settings
 	private static volatile double huntRange = 50.0D;
 
+	// A* Pathfinding settings
+	private static volatile boolean aStarEnabled = false;
+	private static volatile boolean aStarDebugEnabled = false;
+
 	// TPS tracking
 	private static final int TPS_SAMPLE_SIZE = 20;
 	private static final long[] tickTimes = new long[TPS_SAMPLE_SIZE];
@@ -110,6 +114,26 @@ public class ChallengeMod implements ModInitializer {
 
 	public static void setHuntRange(double range) {
 		huntRange = Math.max(10.0, Math.min(500.0, range)); // Clamp between 10 and 500
+	}
+
+	// A* Pathfinding getters and setters
+	public static boolean isAStarEnabled() {
+		return aStarEnabled;
+	}
+
+	public static void setAStarEnabled(boolean enabled) {
+		aStarEnabled = enabled;
+		if (!enabled) {
+			com.example.ai.MobPathManager.clearAll();
+		}
+	}
+
+	public static boolean isAStarDebugEnabled() {
+		return aStarDebugEnabled;
+	}
+
+	public static void setAStarDebugEnabled(boolean enabled) {
+		aStarDebugEnabled = enabled;
 	}
 
 	@Override
@@ -228,6 +252,7 @@ public class ChallengeMod implements ModInitializer {
 		challengeActive = false;
 		challengeLocked = false;
 		AntiTowerHandler.clearAll();
+		com.example.ai.MobPathManager.clearAll();
 		com.example.antitower.MobBreakerHandler.clearAll();
 	}
 

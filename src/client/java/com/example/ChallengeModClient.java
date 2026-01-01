@@ -33,6 +33,9 @@ public class ChallengeModClient implements ClientModInitializer {
 		// Register keybinds
 		ModKeybinds.register();
 
+		// Register debug renderers
+		com.example.render.PathDebugRenderer.register();
+
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
 			dispatcher.register(ClientCommandManager.literal("benchmark")
 					.executes(context -> {

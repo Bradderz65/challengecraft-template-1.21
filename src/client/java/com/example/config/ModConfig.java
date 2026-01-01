@@ -34,6 +34,10 @@ public class ModConfig {
 
         // Hunt settings
         double huntRange = 50.0;
+
+        // A* Pathfinding settings
+        boolean aStarEnabled = false;
+        boolean aStarDebugEnabled = false;
     }
 
     /**
@@ -71,6 +75,8 @@ public class ModConfig {
         ChallengeMod.setAntiTowerEnabled(data.antiTowerEnabled);
         ChallengeMod.setAntiTowerDelay(data.antiTowerDelay);
         ChallengeMod.setHuntRange(data.huntRange);
+        ChallengeMod.setAStarEnabled(data.aStarEnabled);
+        ChallengeMod.setAStarDebugEnabled(data.aStarDebugEnabled);
     }
 
     /**
@@ -120,6 +126,14 @@ public class ModConfig {
         return data.huntRange;
     }
 
+    public static boolean isAStarEnabled() {
+        return data.aStarEnabled;
+    }
+
+    public static boolean isAStarDebugEnabled() {
+        return data.aStarDebugEnabled;
+    }
+
     // ========== Setters ==========
 
     public static void setChallengeActive(boolean active) {
@@ -144,5 +158,13 @@ public class ModConfig {
 
     public static void setHuntRange(double range) {
         data.huntRange = Math.max(10.0, Math.min(500.0, range));
+    }
+
+    public static void setAStarEnabled(boolean enabled) {
+        data.aStarEnabled = enabled;
+    }
+
+    public static void setAStarDebugEnabled(boolean enabled) {
+        data.aStarDebugEnabled = enabled;
     }
 }

@@ -26,6 +26,8 @@ public class ModConfigScreen extends Screen {
     private boolean antiTowerEnabled;
     private double antiTowerDelay;
     private double huntRange;
+    private boolean aStarEnabled;
+    private boolean aStarDebugEnabled;
 
     // UI components
     private Button challengeToggleButton;
@@ -35,6 +37,8 @@ public class ModConfigScreen extends Screen {
     private Button antiTowerToggleButton;
     private Button delayDecreaseButton;
     private Button delayIncreaseButton;
+    private Button aStarToggleButton;
+    private Button aStarDebugToggleButton;
 
     public ModConfigScreen(Screen parent) {
         super(Component.literal("ChallengeCraft Options"));
@@ -47,6 +51,8 @@ public class ModConfigScreen extends Screen {
         this.antiTowerEnabled = ModConfig.isAntiTowerEnabled();
         this.antiTowerDelay = ModConfig.getAntiTowerDelay();
         this.huntRange = ModConfig.getHuntRange();
+        this.aStarEnabled = ModConfig.isAStarEnabled();
+        this.aStarDebugEnabled = ModConfig.isAStarDebugEnabled();
     }
 
     @Override
@@ -54,7 +60,7 @@ public class ModConfigScreen extends Screen {
         super.init();
 
         int centerX = this.width / 2;
-        int startY = this.height / 2 - 110;
+        int startY = this.height / 2 - 140;
         int buttonWidth = PANEL_WIDTH - 20;
 
         // Challenge Active Toggle
@@ -172,6 +178,41 @@ public class ModConfigScreen extends Screen {
                 .tooltip(Tooltip.create(Component.literal("Increase detection range")))
                 .build());
 
+        startY += BUTTON_HEIGHT + BUTTON_SPACING + 10;
+
+        // ========== A* Pathfinding Section ==========
+
+        // A* Pathfinding Toggle
+        this.aStarToggleButton = Button.builder(
+                getAStarToggleText(),
+                button -> {
+                    this.aStarEnabled = !this.aStarEnabled;
+                    button.setMessage(getAStarToggleText());
+                    updateAStarDebugButtonState();
+                })
+                .bounds(centerX - buttonWidth / 2, startY, buttonWidth, BUTTON_HEIGHT)
+                .tooltip(Tooltip.create(
+                        Component.literal("§dA* Pathfinding§r: Advanced pathfinding for mobs to find players")))
+                .build();
+        this.addRenderableWidget(this.aStarToggleButton);
+
+        startY += BUTTON_HEIGHT + BUTTON_SPACING + 6;
+
+        // A* Debug Toggle
+        this.aStarDebugToggleButton = Button.builder(
+                getAStarDebugToggleText(),
+                button -> {
+                    this.aStarDebugEnabled = !this.aStarDebugEnabled;
+                    button.setMessage(getAStarDebugToggleText());
+                })
+                .bounds(centerX - buttonWidth / 2, startY, buttonWidth, BUTTON_HEIGHT)
+                .tooltip(Tooltip.create(
+                        Component.literal("§eDebug§r: Show pathfinding visualization lines")))
+                .build();
+        this.addRenderableWidget(this.aStarDebugToggleButton);
+
+        updateAStarDebugButtonState();
+
         startY += BUTTON_HEIGHT + BUTTON_SPACING + 18;
 
         // Done Button
@@ -194,12 +235,21 @@ public class ModConfigScreen extends Screen {
         }
     }
 
+    /**
+     * Updates the enabled state of A* debug button based on A* enabled state.
+     */
+    private void updateAStarDebugButtonState() {
+        if (this.aStarDebugToggleButton != null) {
+            this.aStarDebugToggleButton.active = this.aStarEnabled;
+        }
+    }
+
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         int centerX = this.width / 2;
         int panelX = centerX - PANEL_WIDTH / 2;
-        int panelY = this.height / 2 - 130;
-        int panelHeight = 270;
+        int panelY = this.height / 2 - 160;
+        int panelHeight = 340;
 
         // Draw semi-transparent panel background
         graphics.fill(panelX, panelY, panelX + PANEL_WIDTH, panelY + panelHeight, 0xCC1a1a2e);
@@ -253,6 +303,8 @@ public class ModConfigScreen extends Screen {
         ModConfig.setAntiTowerEnabled(this.antiTowerEnabled);
         ModConfig.setAntiTowerDelay(this.antiTowerDelay);
         ModConfig.setHuntRange(this.huntRange);
+        ModConfig.setAStarEnabled(this.aStarEnabled);
+        ModConfig.setAStarDebugEnabled(this.aStarDebugEnabled);
         ModConfig.save();
 
         // Return to parent screen
@@ -287,5 +339,18 @@ public class ModConfigScreen extends Screen {
     private Component getAntiTowerToggleText() {
         String status = this.antiTowerEnabled ? "§aON" : "§cOFF";
         return Component.literal("§6Anti-Tower§r: " + status);
+    }
+
+    private Component getAStarToggleText() {
+        String status = this.aStarEnabled ? "§aON" : "§cOFF";
+        return Component.literal("§dA* Pathfinding§r: " + status);
+    }
+
+    private Component getAStarDebugToggleText() {
+        String status = this.aStarDebugEnabled ? "§aON" : "§cOFF";
+        if (!this.aStarEnabled) {
+            status = "§7" + (this.aStarDebugEnabled ? "ON" : "OFF");
+        }
+        return Component.literal("§eShow Path Debug§r: " + status);
     }
 }
