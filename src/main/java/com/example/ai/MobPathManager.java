@@ -124,11 +124,14 @@ public class MobPathManager {
                     cached = new CachedPath(result.path, targetPos);
                     pathCache.put(mob.getUUID(), cached);
 
-                    // Sync path to clients for debug rendering
+                    // Path found, sync to clients and clear any building state
                     syncPathToClients(mob, result.path);
+                    MobBuilderHandler.cancelBuilding(mob); // Cancel building if path found
                 } else {
                     // A* couldn't find a path - check if we should build
-                    if (MobBuilderHandler.shouldBuild(mob, targetPos, true)) {
+                    // Only start building if not already recently completed a build
+                    if (MobBuilderHandler.shouldBuild(mob, targetPos, true) &&
+                            !MobBuilderHandler.recentlyBuilt(mob)) {
                         // Start building a pillar to reach the target
                         MobBuilderHandler.startBuilding(mob, targetPos);
                         pathCache.remove(mob.getUUID());

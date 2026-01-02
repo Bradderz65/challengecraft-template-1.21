@@ -19,9 +19,11 @@ public class MobBuilderHandler {
     // Track building progress per mob
     private static final Map<UUID, BuildingState> buildingStates = new ConcurrentHashMap<>();
 
-    // Block placement delay (ticks between each block placed) - 2 ticks = 0.1
-    // seconds
-    private static final int PLACEMENT_DELAY = 2;
+    // Block placement delay (ticks between each block placed) - 20 ticks = 1 second
+    private static final int PLACEMENT_DELAY = 20;
+
+    // How close mob must be to place a block (3 blocks)
+    private static final double PLACEMENT_RANGE_SQ = 9.0;
 
     // Maximum pillar height to build
     private static final int MAX_PILLAR_HEIGHT = 30;
@@ -154,6 +156,7 @@ public class MobBuilderHandler {
         if (state.isComplete()) {
             buildingStates.remove(mobId);
             BuildPlanData.removeBuildPlan(mobId);
+            markBuildComplete(mob); // Start cooldown to prevent immediate re-building
             return false;
         }
 
@@ -179,6 +182,19 @@ public class MobBuilderHandler {
             buildingStates.remove(mobId);
             BuildPlanData.removeBuildPlan(mobId);
             return false;
+        }
+
+        // Check if mob is close enough to place the block
+        double distSq = mob.blockPosition().distSqr(nextBlock);
+        if (distSq > PLACEMENT_RANGE_SQ) {
+            // Mob needs to move closer - reset timer until in range
+            state.ticksSinceLastPlace = 0;
+            mob.getNavigation().moveTo(
+                    nextBlock.getX() + 0.5,
+                    nextBlock.getY(),
+                    nextBlock.getZ() + 0.5,
+                    1.0);
+            return true;
         }
 
         // Place the block
@@ -248,6 +264,36 @@ public class MobBuilderHandler {
      */
     public static void clearAll() {
         buildingStates.clear();
+        buildCooldowns.clear();
         BuildPlanData.clearAll();
+    }
+
+    // Cooldown tracking - prevent immediate re-building after completion
+    private static final Map<UUID, Long> buildCooldowns = new ConcurrentHashMap<>();
+    private static final long BUILD_COOLDOWN_MS = 5000; // 5 seconds before can build again
+
+    /**
+     * Cancel building for a mob (used when path is found)
+     */
+    public static void cancelBuilding(Mob mob) {
+        buildingStates.remove(mob.getUUID());
+        BuildPlanData.removeBuildPlan(mob.getUUID());
+    }
+
+    /**
+     * Check if mob recently completed a build (to prevent immediate re-building)
+     */
+    public static boolean recentlyBuilt(Mob mob) {
+        Long lastBuild = buildCooldowns.get(mob.getUUID());
+        if (lastBuild == null)
+            return false;
+        return System.currentTimeMillis() - lastBuild < BUILD_COOLDOWN_MS;
+    }
+
+    /**
+     * Mark that a mob just finished building
+     */
+    private static void markBuildComplete(Mob mob) {
+        buildCooldowns.put(mob.getUUID(), System.currentTimeMillis());
     }
 }
