@@ -1,6 +1,5 @@
 package com.example.antitower;
 
-import com.example.ChallengeMod;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
@@ -60,6 +59,21 @@ public class MobBreakerHandler {
         }
     }
 
+    public static boolean tickBreaking(Mob mob, BlockPos pos) {
+        if (mob.level().isClientSide)
+            return false;
+        BlockState state = mob.level().getBlockState(pos);
+        if (state.isAir())
+            return true;
+
+        float hardness = state.getDestroySpeed(mob.level(), pos);
+        if (hardness < 0)
+            return false; // Unbreakable
+
+        damageBlock((ServerLevel) mob.level(), pos, mob, hardness);
+        return false; // Still breaking
+    }
+
     public static void damageBlock(ServerLevel level, BlockPos pos, Mob breaker, float hardness) {
         if (hardness <= 0)
             hardness = 0.05f;
@@ -84,8 +98,7 @@ public class MobBreakerHandler {
             level.destroyBlock(pos, true, breaker);
             blockDamage.remove(pos);
             level.destroyBlockProgress(breakId, pos, -1);
-            String name = breaker != null ? breaker.getType().toShortString() : "unknown";
-            // ChallengeMod.LOGGER.info("[MobBreaker] {} broke block at {}", name, pos);
+            // Logger line removed as requested by cleanup
         } else {
             level.destroyBlockProgress(breakId, pos, progressStage);
         }

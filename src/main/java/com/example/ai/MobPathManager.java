@@ -1,9 +1,12 @@
 package com.example.ai;
 
 import com.example.ChallengeMod;
+import com.example.antitower.MobBreakerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -99,9 +102,15 @@ public class MobPathManager {
         if (needsRecalculation) {
             // Only recalculate on certain ticks to avoid lag
             if (mob.tickCount % 10 == 0) {
-                AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos);
+                // Try standard path first
+                AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
 
-                if (result.found && !result.path.isEmpty()) {
+                // If not found, try destructive pathfinding
+                if (!result.found && !result.isPartial) {
+                    result = AStarPathfinder.findPath(mob, targetPos, true);
+                }
+
+                if ((result.found || result.isPartial) && !result.path.isEmpty()) {
                     cached = new CachedPath(result.path, targetPos);
                     pathCache.put(mob.getUUID(), cached);
 
@@ -134,6 +143,29 @@ public class MobPathManager {
                 }
 
                 if (nextNode != null) {
+                    // Check for obstructions (Block Breaking Logic)
+                    boolean isBlocked = false;
+
+                    // Check feet level
+                    if (isSolid(mob.level(), nextNode)) {
+                        MobBreakerHandler.tickBreaking(mob, nextNode);
+                        isBlocked = true;
+                    }
+                    // Check head level
+                    if (isSolid(mob.level(), nextNode.above())) {
+                        MobBreakerHandler.tickBreaking(mob, nextNode.above());
+                        isBlocked = true;
+                    }
+
+                    if (isBlocked) {
+                        // Look at the block we are breaking
+                        mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
+                                nextNode.getZ() + 0.5);
+                        // Stop moving while breaking
+                        mob.getNavigation().stop();
+                        return true;
+                    }
+
                     // Move towards the next node
                     double speed = ChallengeMod.getSpeedMultiplier();
                     mob.getNavigation().moveTo(
@@ -155,6 +187,11 @@ public class MobPathManager {
         }
 
         return false;
+    }
+
+    private static boolean isSolid(Level level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        return state.blocksMotion();
     }
 
     /**
