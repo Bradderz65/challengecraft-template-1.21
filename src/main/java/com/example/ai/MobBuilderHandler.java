@@ -19,11 +19,12 @@ public class MobBuilderHandler {
     // Track building progress per mob
     private static final Map<UUID, BuildingState> buildingStates = new ConcurrentHashMap<>();
 
-    // Block placement delay (ticks between each block placed)
-    private static final int PLACEMENT_DELAY = 10; // 0.5 seconds
+    // Block placement delay (ticks between each block placed) - 2 ticks = 0.1
+    // seconds
+    private static final int PLACEMENT_DELAY = 2;
 
     // Maximum pillar height to build
-    private static final int MAX_PILLAR_HEIGHT = 20;
+    private static final int MAX_PILLAR_HEIGHT = 30;
 
     /**
      * State of a mob's building progress
@@ -32,13 +33,13 @@ public class MobBuilderHandler {
         public final List<BlockPos> blocksToPlace;
         public int currentIndex;
         public int ticksSinceLastPlace;
-        public final BlockPos targetPos;
+        public final BlockPos lockedTargetPos; // Locked target - doesn't change while building
 
         public BuildingState(List<BlockPos> blocksToPlace, BlockPos targetPos) {
             this.blocksToPlace = blocksToPlace;
             this.currentIndex = 0;
-            this.ticksSinceLastPlace = 0;
-            this.targetPos = targetPos;
+            this.ticksSinceLastPlace = PLACEMENT_DELAY; // Start ready to place
+            this.lockedTargetPos = targetPos;
         }
 
         public boolean isComplete() {
@@ -53,8 +54,34 @@ public class MobBuilderHandler {
     }
 
     /**
+     * Check if a mob is currently building
+     */
+    public static boolean isBuilding(Mob mob) {
+        BuildingState state = buildingStates.get(mob.getUUID());
+        return state != null && !state.isComplete();
+    }
+
+    /**
+     * Start building toward a target position
+     */
+    public static void startBuilding(Mob mob, BlockPos targetPos) {
+        if (mob.level().isClientSide)
+            return;
+
+        List<BlockPos> plan = calculatePillarPlan(mob, targetPos);
+        if (plan.isEmpty())
+            return;
+
+        BuildingState state = new BuildingState(plan, targetPos);
+        buildingStates.put(mob.getUUID(), state);
+
+        // Sync to clients for debug rendering
+        BuildPlanData.setBuildPlan(mob.getUUID(), plan);
+    }
+
+    /**
      * Calculate a pillar build plan to reach an elevated target.
-     * Returns empty list if building isn't needed or possible.
+     * Always builds DIRECTLY under the target position.
      */
     public static List<BlockPos> calculatePillarPlan(Mob mob, BlockPos targetPos) {
         Level level = mob.level();
@@ -66,9 +93,9 @@ public class MobBuilderHandler {
             return Collections.emptyList();
         }
 
-        // Find the best pillar position (directly below target, or as close as
-        // possible)
-        BlockPos pillarBase = findPillarBase(level, mobPos, targetPos);
+        // Always build directly under target
+        BlockPos pillarBase = findGroundPos(level, new BlockPos(targetPos.getX(), targetPos.getY(), targetPos.getZ()));
+
         if (pillarBase == null) {
             return Collections.emptyList();
         }
@@ -78,7 +105,7 @@ public class MobBuilderHandler {
         int targetHeight = targetPos.getY() - 1; // One below target so they can climb onto platform
 
         for (int y = pillarBase.getY(); y <= targetHeight && plan.size() < MAX_PILLAR_HEIGHT; y++) {
-            BlockPos pos = new BlockPos(pillarBase.getX(), y, pillarBase.getZ());
+            BlockPos pos = new BlockPos(targetPos.getX(), y, targetPos.getZ());
             BlockState state = level.getBlockState(pos);
 
             // Only add if position is air
@@ -88,24 +115,6 @@ public class MobBuilderHandler {
         }
 
         return plan;
-    }
-
-    /**
-     * Find the best base position for a pillar
-     */
-    private static BlockPos findPillarBase(Level level, BlockPos mobPos, BlockPos targetPos) {
-        // Try directly under the target first
-        BlockPos underTarget = new BlockPos(targetPos.getX(), mobPos.getY(), targetPos.getZ());
-
-        // Check if mob can reach this position (within reasonable distance)
-        double distSq = mobPos.distSqr(underTarget);
-        if (distSq > 100) { // More than 10 blocks away
-            // Try to find a closer position
-            // Build from where the mob currently is
-            return findGroundPos(level, mobPos);
-        }
-
-        return findGroundPos(level, underTarget);
     }
 
     /**
@@ -136,23 +145,15 @@ public class MobBuilderHandler {
         UUID mobId = mob.getUUID();
         BuildingState state = buildingStates.get(mobId);
 
-        // Check if we need to calculate a new build plan
-        if (state == null || state.isComplete() || !state.targetPos.closerThan(targetPos, 5)) {
-            List<BlockPos> plan = calculatePillarPlan(mob, targetPos);
-            if (plan.isEmpty()) {
-                buildingStates.remove(mobId);
-                BuildPlanData.removeBuildPlan(mobId);
-                return false;
-            }
-            state = new BuildingState(plan, targetPos);
-            buildingStates.put(mobId, state);
-
-            // Sync to clients for debug rendering
-            BuildPlanData.setBuildPlan(mobId, plan);
+        // No active build state
+        if (state == null) {
+            return false;
         }
 
         // Check if building is complete
         if (state.isComplete()) {
+            buildingStates.remove(mobId);
+            BuildPlanData.removeBuildPlan(mobId);
             return false;
         }
 
@@ -161,18 +162,22 @@ public class MobBuilderHandler {
 
         // Check if enough time has passed to place a block
         if (state.ticksSinceLastPlace < PLACEMENT_DELAY) {
-            return true; // Still waiting, but mob should stay focused
+            // Still waiting - mob should move toward pillar
+            BlockPos nextBlock = state.getNextBlock();
+            if (nextBlock != null) {
+                mob.getNavigation().moveTo(
+                        nextBlock.getX() + 0.5,
+                        nextBlock.getY(),
+                        nextBlock.getZ() + 0.5,
+                        1.0);
+            }
+            return true;
         }
 
         BlockPos nextBlock = state.getNextBlock();
         if (nextBlock == null) {
-            return false;
-        }
-
-        // Check if mob is close enough to place the block
-        double distSq = mob.blockPosition().distSqr(nextBlock);
-        if (distSq > 16) { // More than 4 blocks away
-            // Mob needs to move closer first
+            buildingStates.remove(mobId);
+            BuildPlanData.removeBuildPlan(mobId);
             return false;
         }
 
@@ -189,13 +194,18 @@ public class MobBuilderHandler {
             state.ticksSinceLastPlace = 0;
 
             // Update debug data with remaining blocks
-            List<BlockPos> remaining = state.blocksToPlace.subList(
-                    state.currentIndex,
-                    state.blocksToPlace.size());
-            BuildPlanData.setBuildPlan(mobId, remaining);
+            if (!state.isComplete()) {
+                List<BlockPos> remaining = state.blocksToPlace.subList(
+                        state.currentIndex,
+                        state.blocksToPlace.size());
+                BuildPlanData.setBuildPlan(mobId, remaining);
+            } else {
+                BuildPlanData.removeBuildPlan(mobId);
+            }
         } else {
             // Block already occupied, skip it
             state.currentIndex++;
+            state.ticksSinceLastPlace = 0;
         }
 
         // Look at where we're building

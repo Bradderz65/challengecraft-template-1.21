@@ -99,6 +99,16 @@ public class MobPathManager {
                 || cached.isComplete()
                 || !cached.targetPos.closerThan(targetPos, 5); // Target moved significantly
 
+        // Check if mob is currently building (tick building every frame, not just
+        // during recalc)
+        if (MobBuilderHandler.isBuilding(mob)) {
+            boolean stillBuilding = MobBuilderHandler.tickBuilding(mob, targetPos);
+            if (stillBuilding) {
+                return true; // Mob is building, don't do pathfinding
+            }
+            // Building complete, try pathfinding again
+        }
+
         if (needsRecalculation) {
             // Only recalculate on certain ticks to avoid lag
             if (mob.tickCount % 10 == 0) {
@@ -119,14 +129,11 @@ public class MobPathManager {
                 } else {
                     // A* couldn't find a path - check if we should build
                     if (MobBuilderHandler.shouldBuild(mob, targetPos, true)) {
-                        // Try building a pillar to reach the target
-                        boolean isBuilding = MobBuilderHandler.tickBuilding(mob, targetPos);
-                        if (isBuilding) {
-                            // Mob is building, stop pathfinding
-                            pathCache.remove(mob.getUUID());
-                            clearClientPath(mob);
-                            return true;
-                        }
+                        // Start building a pillar to reach the target
+                        MobBuilderHandler.startBuilding(mob, targetPos);
+                        pathCache.remove(mob.getUUID());
+                        clearClientPath(mob);
+                        return true;
                     }
                     // Fall back to vanilla
                     pathCache.remove(mob.getUUID());
