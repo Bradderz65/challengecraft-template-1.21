@@ -117,7 +117,18 @@ public class MobPathManager {
                     // Sync path to clients for debug rendering
                     syncPathToClients(mob, result.path);
                 } else {
-                    // A* couldn't find a path, fall back to vanilla
+                    // A* couldn't find a path - check if we should build
+                    if (MobBuilderHandler.shouldBuild(mob, targetPos, true)) {
+                        // Try building a pillar to reach the target
+                        boolean isBuilding = MobBuilderHandler.tickBuilding(mob, targetPos);
+                        if (isBuilding) {
+                            // Mob is building, stop pathfinding
+                            pathCache.remove(mob.getUUID());
+                            clearClientPath(mob);
+                            return true;
+                        }
+                    }
+                    // Fall back to vanilla
                     pathCache.remove(mob.getUUID());
                     clearClientPath(mob);
                     return false;
@@ -216,6 +227,7 @@ public class MobPathManager {
     public static void onMobRemoved(Mob mob) {
         pathCache.remove(mob.getUUID());
         PathDebugData.removeMobPath(mob.getUUID());
+        MobBuilderHandler.onMobRemoved(mob);
     }
 
     /**
@@ -224,6 +236,7 @@ public class MobPathManager {
     public static void clearAll() {
         pathCache.clear();
         PathDebugData.clearAll();
+        MobBuilderHandler.clearAll();
     }
 
     /**

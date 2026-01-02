@@ -2,6 +2,7 @@ package com.example.render;
 
 import com.example.config.ModConfig;
 import com.example.ai.PathDebugData;
+import com.example.ai.BuildPlanData;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
@@ -27,6 +28,7 @@ public class PathDebugRenderer {
     private static final float[] NODE_COLOR = { 1.0f, 0.8f, 0.0f, 1.0f }; // Gold
     private static final float[] START_COLOR = { 0.0f, 0.5f, 1.0f, 1.0f }; // Blue
     private static final float[] END_COLOR = { 1.0f, 0.0f, 0.5f, 1.0f }; // Pink
+    private static final float[] BUILD_COLOR = { 0.0f, 1.0f, 0.3f, 1.0f }; // Green for build markers
 
     /**
      * Register the renderer with Fabric's world render events
@@ -64,6 +66,16 @@ public class PathDebugRenderer {
             List<BlockPos> path = entry.getValue();
             if (path != null && path.size() > 1) {
                 renderPath(poseStack, bufferSource, path);
+            }
+        }
+
+        // Render build plans (blocks to be placed)
+        Map<UUID, List<BlockPos>> allBuildPlans = BuildPlanData.getAllBuildPlans();
+
+        for (Map.Entry<UUID, List<BlockPos>> entry : allBuildPlans.entrySet()) {
+            List<BlockPos> plan = entry.getValue();
+            if (plan != null && !plan.isEmpty()) {
+                renderBuildPlan(poseStack, bufferSource, plan);
             }
         }
 
@@ -213,5 +225,55 @@ public class PathDebugRenderer {
                 from[2] + (to[2] - from[2]) * t,
                 from[3] + (to[3] - from[3]) * t
         };
+    }
+
+    /**
+     * Render a build plan (blocks to be placed) as green wireframe cubes
+     */
+    private static void renderBuildPlan(PoseStack poseStack, MultiBufferSource.BufferSource bufferSource,
+            List<BlockPos> plan) {
+        if (plan.isEmpty())
+            return;
+
+        for (int i = 0; i < plan.size(); i++) {
+            BlockPos pos = plan.get(i);
+
+            // Render full-size wireframe cube at block position
+            renderBuildMarker(poseStack, bufferSource, pos, BUILD_COLOR, i + 1);
+        }
+    }
+
+    /**
+     * Render a build marker (full block wireframe cube) with order number
+     */
+    private static void renderBuildMarker(PoseStack poseStack, MultiBufferSource.BufferSource bufferSource,
+            BlockPos pos, float[] color, int orderNum) {
+        VertexConsumer consumer = bufferSource.getBuffer(RenderType.lines());
+        Matrix4f matrix = poseStack.last().pose();
+
+        float x = pos.getX();
+        float y = pos.getY();
+        float z = pos.getZ();
+
+        // Draw a full block wireframe (1x1x1 cube)
+        // Bottom face
+        drawLine(consumer, matrix, poseStack, x, y, z, x + 1, y, z, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y, z, x + 1, y, z + 1, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y, z + 1, x, y, z + 1, color);
+        drawLine(consumer, matrix, poseStack, x, y, z + 1, x, y, z, color);
+
+        // Top face
+        drawLine(consumer, matrix, poseStack, x, y + 1, z, x + 1, y + 1, z, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y + 1, z, x + 1, y + 1, z + 1, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y + 1, z + 1, x, y + 1, z + 1, color);
+        drawLine(consumer, matrix, poseStack, x, y + 1, z + 1, x, y + 1, z, color);
+
+        // Vertical edges
+        drawLine(consumer, matrix, poseStack, x, y, z, x, y + 1, z, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y, z, x + 1, y + 1, z, color);
+        drawLine(consumer, matrix, poseStack, x + 1, y, z + 1, x + 1, y + 1, z + 1, color);
+        drawLine(consumer, matrix, poseStack, x, y, z + 1, x, y + 1, z + 1, color);
+
+        bufferSource.endBatch(RenderType.lines());
     }
 }
