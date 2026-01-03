@@ -140,7 +140,10 @@ public abstract class MobEntityMixin {
 							mob.setSprinting(true);
 							// Explicitly push towards target to ensure we clear the gap
 							Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
-							mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.3)));
+							double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
+							if (currentSpeed < 0.3) {
+								mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.15)));
+							}
 						}
 					} else {
 						mob.setSprinting(false);
@@ -346,7 +349,7 @@ public abstract class MobEntityMixin {
 				}
 
 				// Keep climbing logic
-				if (mob.horizontalCollision && mob.onGround()) {
+				if (mob.horizontalCollision && mob.onGround() && horizontalDistSqr < 25.0) {
 					mob.getJumpControl().jump();
 				}
 			} else if (horizontalDistSqr < 900.0) {

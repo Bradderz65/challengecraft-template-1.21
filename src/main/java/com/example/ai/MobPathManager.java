@@ -81,8 +81,8 @@ public class MobPathManager {
 
         double distance = mob.distanceTo(target);
 
-        // For very close ranges, don't use A*
-        if (distance < 3.0) {
+        // For very close ranges, don't use A* (unless we are touching the player)
+        if (distance < 1.5) {
             pathCache.remove(mob.getUUID());
             return false;
         }
@@ -105,23 +105,32 @@ public class MobPathManager {
         if (needsRecalculation) {
             // Only recalculate on certain ticks to avoid lag
             if (mob.tickCount % 10 == 0) {
-                // Try standard path first
+                // 1. Try standard path first
                 AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
 
-                // If not found, try destructive pathfinding (breaking)
+                // 2. If not found, try SOFT destructive pathfinding (breaking only weak blocks like dirt/leaves)
+                // Hardness <= 1.0 covers dirt (0.5), sand (0.5), leaves (0.2), wool (0.8), but excludes stone (1.5), wood (2.0)
                 if (!result.found) {
-                    AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
-                    if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
-                        result = destructiveResult;
+                    AStarPathfinder.PathResult softBreakResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, false, 1.0f);
+                    if (softBreakResult.found || (softBreakResult.isPartial && !result.isPartial)) {
+                        result = softBreakResult;
                     }
                 }
                 
-                // If still not found, try BUILDING pathfinding
+                // 3. If still not found, try BUILDING pathfinding (bridge/pillar)
                 if (!result.found) {
                      AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
                      if (buildResult.found || (buildResult.isPartial && !result.isPartial)) {
                          result = buildResult;
                      }
+                }
+
+                // 4. If still not found, try HARD destructive pathfinding (breaking anything)
+                if (!result.found) {
+                    AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
+                    if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
+                        result = destructiveResult;
+                    }
                 }
 
                 if (result.found && !result.path.isEmpty()) {
@@ -196,6 +205,9 @@ public class MobPathManager {
 
                              // Place block
                              mob.level().setBlock(buildTarget, net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState(), 3);
+                             if (ChallengeMod.isAStarDebugEnabled()) {
+                                 ChallengeMod.LOGGER.info("[Action] Mob {} placing block at {}", mob.getUUID().toString().substring(0, 4), buildTarget);
+                             }
                              cached.placeDelay = 30; // 1.5s delay between placements
                              return true; // Stay here until placed (next tick)
                          }
@@ -232,6 +244,13 @@ public class MobPathManager {
                         // Look at the block we are breaking
                         mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
                                 nextNode.getZ() + 0.5);
+                                
+                        if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
+                             BlockState state = mob.level().getBlockState(nextNode);
+                             if (!state.blocksMotion()) state = mob.level().getBlockState(nextNode.above());
+                             ChallengeMod.LOGGER.info("[Action] Mob {} breaking {} at {}", mob.getUUID().toString().substring(0, 4), state.getBlock().getName().getString(), nextNode);
+                        }
+                        
                         // Stop moving while breaking
                         mob.getNavigation().stop();
                         return true;
@@ -239,7 +258,14 @@ public class MobPathManager {
 
                     // Move towards the next node
                     double speed = ChallengeMod.getSpeedMultiplier();
-                    mob.getNavigation().moveTo(
+
+                    // Slow down if the next node is below us (drop) to prevent flying off
+                    if (nextNode.getY() < mob.getY() - 0.2) {
+                        speed *= 0.5;
+                    }
+
+                    // Use MoveControl instead of Navigation to prevent stuttering/re-pathing every tick
+                    mob.getMoveControl().setWantedPosition(
                             nextNode.getX() + 0.5,
                             nextNode.getY(),
                             nextNode.getZ() + 0.5,

@@ -29,6 +29,7 @@ public class PathDebugRenderer {
     private static final float[] START_COLOR = { 0.0f, 0.5f, 1.0f, 1.0f }; // Blue
     private static final float[] END_COLOR = { 1.0f, 0.0f, 0.5f, 1.0f }; // Pink
     private static final float[] BUILD_COLOR = { 0.0f, 1.0f, 0.3f, 1.0f }; // Green for build markers
+    private static final float[] BREAK_COLOR = { 1.0f, 0.0f, 0.0f, 1.0f }; // Red for break markers
 
     /**
      * Register the renderer with Fabric's world render events
@@ -137,21 +138,20 @@ public class PathDebugRenderer {
         // Render node markers
         for (int i = 0; i < path.size(); i++) {
             BlockPos pos = path.get(i);
-            float[] color;
-            float size;
+            
+            // Check if block is solid (needs breaking)
+            boolean isSolid = Minecraft.getInstance().level.getBlockState(pos).blocksMotion();
 
-            if (i == 0) {
-                color = START_COLOR;
-                size = 0.3f;
+            if (isSolid) {
+                // Render full-size red wireframe for break targets
+                renderBlockMarker(poseStack, bufferSource, pos, BREAK_COLOR, 0.005f);
+            } else if (i == 0) {
+                renderNodeMarker(poseStack, bufferSource, pos, START_COLOR, 0.3f);
             } else if (i == path.size() - 1) {
-                color = END_COLOR;
-                size = 0.3f;
+                renderNodeMarker(poseStack, bufferSource, pos, END_COLOR, 0.3f);
             } else {
-                color = NODE_COLOR;
-                size = 0.15f;
+                renderNodeMarker(poseStack, bufferSource, pos, NODE_COLOR, 0.15f);
             }
-
-            renderNodeMarker(poseStack, bufferSource, pos, color, size);
         }
     }
 
@@ -169,7 +169,7 @@ public class PathDebugRenderer {
 
         float half = size / 2;
 
-        // Draw a wireframe cube
+        // Draw a small wireframe cube
         // Bottom face
         drawLine(consumer, matrix, poseStack, x - half, y - half, z - half, x + half, y - half, z - half, color);
         drawLine(consumer, matrix, poseStack, x + half, y - half, z - half, x + half, y - half, z + half, color);
@@ -235,44 +235,49 @@ public class PathDebugRenderer {
         if (plan.isEmpty())
             return;
 
-        for (int i = 0; i < plan.size(); i++) {
-            BlockPos pos = plan.get(i);
-
-            // Render full-size wireframe cube at block position
-            renderBuildMarker(poseStack, bufferSource, pos, BUILD_COLOR, i + 1);
+        for (BlockPos pos : plan) {
+            // Render full-size green wireframe cube at block position
+            renderBlockMarker(poseStack, bufferSource, pos, BUILD_COLOR, 0.0f);
         }
     }
 
     /**
-     * Render a build marker (full block wireframe cube) with order number
+     * Render a full block wireframe cube with optional inflation
      */
-    private static void renderBuildMarker(PoseStack poseStack, MultiBufferSource.BufferSource bufferSource,
-            BlockPos pos, float[] color, int orderNum) {
+    private static void renderBlockMarker(PoseStack poseStack, MultiBufferSource.BufferSource bufferSource,
+            BlockPos pos, float[] color, float inflation) {
         VertexConsumer consumer = bufferSource.getBuffer(RenderType.lines());
         Matrix4f matrix = poseStack.last().pose();
 
         float x = pos.getX();
         float y = pos.getY();
         float z = pos.getZ();
+        
+        float minX = x - inflation;
+        float minY = y - inflation;
+        float minZ = z - inflation;
+        float maxX = x + 1 + inflation;
+        float maxY = y + 1 + inflation;
+        float maxZ = z + 1 + inflation;
 
         // Draw a full block wireframe (1x1x1 cube)
         // Bottom face
-        drawLine(consumer, matrix, poseStack, x, y, z, x + 1, y, z, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y, z, x + 1, y, z + 1, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y, z + 1, x, y, z + 1, color);
-        drawLine(consumer, matrix, poseStack, x, y, z + 1, x, y, z, color);
+        drawLine(consumer, matrix, poseStack, minX, minY, minZ, maxX, minY, minZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, minY, minZ, maxX, minY, maxZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, minY, maxZ, minX, minY, maxZ, color);
+        drawLine(consumer, matrix, poseStack, minX, minY, maxZ, minX, minY, minZ, color);
 
         // Top face
-        drawLine(consumer, matrix, poseStack, x, y + 1, z, x + 1, y + 1, z, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y + 1, z, x + 1, y + 1, z + 1, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y + 1, z + 1, x, y + 1, z + 1, color);
-        drawLine(consumer, matrix, poseStack, x, y + 1, z + 1, x, y + 1, z, color);
+        drawLine(consumer, matrix, poseStack, minX, maxY, minZ, maxX, maxY, minZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, maxY, minZ, maxX, maxY, maxZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, maxY, maxZ, minX, maxY, maxZ, color);
+        drawLine(consumer, matrix, poseStack, minX, maxY, maxZ, minX, maxY, minZ, color);
 
         // Vertical edges
-        drawLine(consumer, matrix, poseStack, x, y, z, x, y + 1, z, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y, z, x + 1, y + 1, z, color);
-        drawLine(consumer, matrix, poseStack, x + 1, y, z + 1, x + 1, y + 1, z + 1, color);
-        drawLine(consumer, matrix, poseStack, x, y, z + 1, x, y + 1, z + 1, color);
+        drawLine(consumer, matrix, poseStack, minX, minY, minZ, minX, maxY, minZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, minY, minZ, maxX, maxY, minZ, color);
+        drawLine(consumer, matrix, poseStack, maxX, minY, maxZ, maxX, maxY, maxZ, color);
+        drawLine(consumer, matrix, poseStack, minX, minY, maxZ, minX, maxY, maxZ, color);
 
         bufferSource.endBatch(RenderType.lines());
     }

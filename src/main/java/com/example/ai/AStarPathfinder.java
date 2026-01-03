@@ -3,6 +3,7 @@ package com.example.ai;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.pathfinder.PathComputationType;
 
@@ -117,6 +118,10 @@ public class AStarPathfinder {
     }
 
     public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking, boolean allowBuilding) {
+        return findPath(mob, start, target, allowBreaking, allowBuilding, Float.MAX_VALUE);
+    }
+
+    public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking, boolean allowBuilding, float maxHardness) {
         Level level = mob.level();
 
         // Quick checks
@@ -163,9 +168,9 @@ public class AStarPathfinder {
                 BlockPos neighborPos = current.pos.offset(dir[0], dir[1], dir[2]);
 
                 // 1. Try Standard Move (Walk / Climb)
-                if (isValidMove(level, current.pos, neighborPos, mob, allowBreaking)) {
+                if (isValidMove(level, current.pos, neighborPos, mob, allowBreaking, maxHardness)) {
                     processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob, false,
-                            allowBreaking, null);
+                            allowBreaking, null, maxHardness);
                 }
                 // 2. Try Drop Move (Walk off, fall to ground)
                 else {
@@ -173,21 +178,21 @@ public class AStarPathfinder {
                     // Must be horizontal move (dy=0 or maybe -1) into Air
                     int dy = neighborPos.getY() - current.pos.getY();
                     if (dy <= 0) {
-                        if (isPassable(level, neighborPos, allowBreaking)
-                                && hasHeadroom(level, neighborPos, allowBreaking)) {
+                        if (isPassable(level, neighborPos, allowBreaking, maxHardness)
+                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)) {
                             // Scan down for ground
                             for (int i = 1; i <= 4; i++) {
                                 BlockPos landing = neighborPos.below(i);
-                                if (canStandAt(level, landing, allowBreaking)) {
+                                if (canStandAt(level, landing, allowBreaking, maxHardness)) {
                                     // Found safe landing!
                                     // Connect Current -> Landing.
                                     // Add cost based on distance
                                     processNeighbor(current, landing, level, openSet, closedSet, allNodes, target, mob,
-                                            false, allowBreaking, null);
+                                            false, allowBreaking, null, maxHardness);
                                     break; // Only register the first solid landing
                                 }
                                 BlockState s = level.getBlockState(landing);
-                                if (s.blocksMotion() && (!allowBreaking || s.getDestroySpeed(level, landing) < 0)) {
+                                if (s.blocksMotion() && (!allowBreaking || s.getDestroySpeed(level, landing) < 0 || s.getDestroySpeed(level, landing) > maxHardness)) {
                                     break; // Hit obstruction that we can't stand on (lava? slab?), stop.
                                 }
                             }
@@ -201,14 +206,14 @@ public class AStarPathfinder {
                     // We place a block at neighbor.below()
                     int dy = neighborPos.getY() - current.pos.getY();
                     if (dy == 0) { // Horizontal
-                        if (isPassable(level, neighborPos, allowBreaking)
-                                && hasHeadroom(level, neighborPos, allowBreaking)) {
+                        if (isPassable(level, neighborPos, allowBreaking, maxHardness)
+                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)) {
                             BlockPos bridgeBlock = neighborPos.below();
                             if (level.getBlockState(bridgeBlock).isAir()
                                     || level.getBlockState(bridgeBlock).liquid()) {
                                 // We can bridge here
                                 processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob,
-                                        false, allowBreaking, bridgeBlock);
+                                        false, allowBreaking, bridgeBlock, maxHardness);
                             }
                         }
                     }
@@ -218,10 +223,10 @@ public class AStarPathfinder {
             // 4. Try Building Moves (Pillar Up)
             if (allowBuilding) {
                 BlockPos up = current.pos.above();
-                if (isPassable(level, up, allowBreaking) && isPassable(level, up.above(), allowBreaking)) {
+                if (isPassable(level, up, allowBreaking, maxHardness) && isPassable(level, up.above(), allowBreaking, maxHardness)) {
                     // We can pillar up by placing a block at current.pos (jumping up)
                     // We arrive at 'up'. The block to place is 'current.pos'.
-                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, mob, true, allowBreaking, current.pos);
+                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, mob, true, allowBreaking, current.pos, maxHardness);
                 }
             }
 
@@ -232,9 +237,9 @@ public class AStarPathfinder {
                 BlockPos jumpTarget = current.pos.offset(jump[0], jump[1], jump[2]);
                 BlockPos midPoint = current.pos.offset(jump[0] / 2, jump[1] / 2, jump[2] / 2);
 
-                if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking)) {
+                if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking, maxHardness)) {
                     processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, mob, true,
-                            allowBreaking, null);
+                            allowBreaking, null, maxHardness);
                 }
             }
         }
@@ -267,18 +272,18 @@ public class AStarPathfinder {
     private static void processNeighbor(PathNode current, BlockPos neighborPos, Level level,
             PriorityQueue<PathNode> openSet,
             Set<BlockPos> closedSet, Map<BlockPos, PathNode> allNodes, BlockPos target, Mob mob, boolean isJump,
-            boolean allowBreaking, BlockPos buildBlock) {
+            boolean allowBreaking, BlockPos buildBlock, float maxHardness) {
         if (closedSet.contains(neighborPos)) {
             return;
         }
 
         // Check if this movement is valid (Standard or Jump already validated)
         // If building, we skip isValidMove because we are creating the valid condition
-        if (buildBlock == null && !isJump && !isValidMove(level, current.pos, neighborPos, mob, allowBreaking)) {
+        if (buildBlock == null && !isJump && !isValidMove(level, current.pos, neighborPos, mob, allowBreaking, maxHardness)) {
             return;
         }
 
-        double moveCost = calculateMoveCost(level, current.pos, neighborPos, allowBreaking);
+        double moveCost = calculateMoveCost(level, current.pos, neighborPos, allowBreaking, maxHardness);
         if (isJump)
             moveCost += 0.5; // Jump penalty
 
@@ -306,17 +311,26 @@ public class AStarPathfinder {
         }
     }
 
+    private static boolean isDanger(Level level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        return state.is(Blocks.LAVA) || state.is(Blocks.FIRE) || state.is(Blocks.MAGMA_BLOCK);
+    }
+
     private static boolean isValidJump(Level level, BlockPos start, BlockPos mid, BlockPos end, Mob mob,
-            boolean allowBreaking) {
+            boolean allowBreaking, float maxHardness) {
         if (!level.isInWorldBounds(end) || !level.hasChunkAt(end))
             return false;
 
-        // 1. Landing must be safe (standable)
-        if (!canStandAt(level, end, allowBreaking))
+        // 1. Landing must be safe (standable) AND not dangerous
+        if (!canStandAt(level, end, allowBreaking, maxHardness) || isDanger(level, end) || isDanger(level, end.below()))
             return false;
 
-        // 2. Midpoint must be passable AIR (or partial)
-        if (!isPassable(level, mid, allowBreaking) || !hasHeadroom(level, mid, allowBreaking))
+        // 2. Midpoint must be passable AIR (or partial) AND not dangerous
+        if (!isPassable(level, mid, allowBreaking, maxHardness) || !hasHeadroom(level, mid, allowBreaking, maxHardness))
+            return false;
+            
+        // Check if midpoint itself is dangerous (e.g. jumping through lava)
+        if (isDanger(level, mid) || isDanger(level, mid.above()))
             return false;
 
         return true;
@@ -338,7 +352,7 @@ public class AStarPathfinder {
     /**
      * Calculate the cost of moving between two positions
      */
-    private static double calculateMoveCost(Level level, BlockPos from, BlockPos to, boolean allowBreaking) {
+    private static double calculateMoveCost(Level level, BlockPos from, BlockPos to, boolean allowBreaking, float maxHardness) {
         double dx = from.getX() - to.getX();
         double dy = from.getY() - to.getY();
         double dz = from.getZ() - to.getZ();
@@ -349,12 +363,41 @@ public class AStarPathfinder {
             distance += 1.0;
         }
 
+        // Avoid dangerous blocks
+        BlockState state = level.getBlockState(to);
+        if (state.is(Blocks.LAVA) || state.is(Blocks.FIRE) || state.is(Blocks.MAGMA_BLOCK)) {
+            distance += 1000.0;
+        }
+        BlockState below = level.getBlockState(to.below());
+        if (below.is(Blocks.LAVA) || below.is(Blocks.FIRE) || below.is(Blocks.MAGMA_BLOCK)) {
+            distance += 500.0;
+        }
+
+        // Safety margin: Check neighbors for danger
+        for (int[] dir : DIRECTIONS) {
+            if (dir[1] == 0) { // Horizontal neighbors only
+                BlockPos neighbor = to.offset(dir[0], dir[1], dir[2]);
+                BlockState nState = level.getBlockState(neighbor);
+                if (nState.is(Blocks.LAVA) || nState.is(Blocks.FIRE) || nState.is(Blocks.MAGMA_BLOCK)) {
+                    distance += 200.0; // Penalty for walking next to danger
+                }
+            }
+        }
+
         if (allowBreaking) {
-            // High cost for breaking blocks
-            if (!isPassable(level, to, false))
-                distance += 50.0;
-            if (!isPassable(level, to.above(), false))
-                distance += 50.0;
+            // Cost based on block hardness
+            if (!isPassable(level, to, false, maxHardness)) {
+                 BlockState s = level.getBlockState(to);
+                 float hardness = s.getDestroySpeed(level, to);
+                 distance += 10.0 + (hardness * 5.0);
+                 if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+            }
+            if (!isPassable(level, to.above(), false, maxHardness)) {
+                 BlockState s = level.getBlockState(to.above());
+                 float hardness = s.getDestroySpeed(level, to.above());
+                 distance += 10.0 + (hardness * 5.0);
+                 if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+            }
         }
 
         return distance;
@@ -364,7 +407,7 @@ public class AStarPathfinder {
      * Check if a movement from one position to another is valid
      */
     @SuppressWarnings("deprecation")
-    private static boolean isValidMove(Level level, BlockPos from, BlockPos to, Mob mob, boolean allowBreaking) {
+    private static boolean isValidMove(Level level, BlockPos from, BlockPos to, Mob mob, boolean allowBreaking, float maxHardness) {
         // Check if the target position is within the world
         if (!level.isInWorldBounds(to)) {
             return false;
@@ -375,8 +418,18 @@ public class AStarPathfinder {
             return false;
         }
 
+        // DANGER CHECK: Do not allow moving into dangerous blocks
+        BlockState toState = level.getBlockState(to);
+        if (toState.is(Blocks.LAVA) || toState.is(Blocks.FIRE) || toState.is(Blocks.MAGMA_BLOCK)) {
+            return false;
+        }
+        BlockState belowState = level.getBlockState(to.below());
+        if (belowState.is(Blocks.LAVA) || belowState.is(Blocks.FIRE) || belowState.is(Blocks.MAGMA_BLOCK)) {
+            return false;
+        }
+
         // Check if the mob can stand at the target position
-        if (!canStandAt(level, to, allowBreaking)) {
+        if (!canStandAt(level, to, allowBreaking, maxHardness)) {
             return false;
         }
 
@@ -430,7 +483,7 @@ public class AStarPathfinder {
         }
 
         // Check if there's enough headroom at both positions
-        if (!hasHeadroom(level, from, allowBreaking) || !hasHeadroom(level, to, allowBreaking)) {
+        if (!hasHeadroom(level, from, allowBreaking, maxHardness) || !hasHeadroom(level, to, allowBreaking, maxHardness)) {
             return false;
         }
 
@@ -441,7 +494,14 @@ public class AStarPathfinder {
                 // Check both intermediate positions
                 BlockPos check1 = from.offset(dx, 0, 0);
                 BlockPos check2 = from.offset(0, 0, dz);
-                if (!isPassable(level, check1, allowBreaking) || !isPassable(level, check2, allowBreaking)) {
+                if (!isPassable(level, check1, allowBreaking, maxHardness) || !isPassable(level, check2, allowBreaking, maxHardness)) {
+                    return false;
+                }
+                
+                // CRITICAL: Corner Cutting Safety
+                // If either corner is dangerous (Lava/Fire), we CANNOT move diagonally.
+                // Even if "passable" (liquid), it's deadly to clip it.
+                if (isDanger(level, check1) || isDanger(level, check2)) {
                     return false;
                 }
             }
@@ -464,9 +524,9 @@ public class AStarPathfinder {
      * and head level, OR climbing support)
      */
     @SuppressWarnings("deprecation")
-    private static boolean canStandAt(Level level, BlockPos pos, boolean allowBreaking) {
+    private static boolean canStandAt(Level level, BlockPos pos, boolean allowBreaking, float maxHardness) {
         // Need passable space at feet and head
-        if (!isPassable(level, pos, allowBreaking) || !isPassable(level, pos.above(), allowBreaking)) {
+        if (!isPassable(level, pos, allowBreaking, maxHardness) || !isPassable(level, pos.above(), allowBreaking, maxHardness)) {
             return false;
         }
 
@@ -515,29 +575,29 @@ public class AStarPathfinder {
     /**
      * Check if there's headroom (2 blocks of air)
      */
-    private static boolean hasHeadroom(Level level, BlockPos pos, boolean allowBreaking) {
-        return isPassable(level, pos, allowBreaking) && isPassable(level, pos.above(), allowBreaking);
+    private static boolean hasHeadroom(Level level, BlockPos pos, boolean allowBreaking, float maxHardness) {
+        return isPassable(level, pos, allowBreaking, maxHardness) && isPassable(level, pos.above(), allowBreaking, maxHardness);
     }
 
     /**
      * Check if a block is passable
      */
     @SuppressWarnings("deprecation")
-    private static boolean isPassable(Level level, BlockPos pos, boolean allowBreaking) {
+    private static boolean isPassable(Level level, BlockPos pos, boolean allowBreaking, float maxHardness) {
         BlockState state = level.getBlockState(pos);
         if (state.isPathfindable(PathComputationType.LAND) || !state.blocksMotion()) {
             return true;
         }
-        return allowBreaking && isBreakable(level, pos);
+        return allowBreaking && isBreakable(level, pos, maxHardness);
     }
 
     // Check if a block is passable in normal mode (helper)
     private static boolean isPassable(Level level, BlockPos pos) {
-        return isPassable(level, pos, false);
+        return isPassable(level, pos, false, Float.MAX_VALUE);
     }
 
-    private static boolean isBreakable(Level level, BlockPos pos) {
+    private static boolean isBreakable(Level level, BlockPos pos, float maxHardness) {
         BlockState state = level.getBlockState(pos);
-        return !state.isAir() && state.getDestroySpeed(level, pos) >= 0;
+        return !state.isAir() && state.getDestroySpeed(level, pos) >= 0 && state.getDestroySpeed(level, pos) <= maxHardness;
     }
 }
