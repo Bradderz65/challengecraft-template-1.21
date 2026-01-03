@@ -41,11 +41,13 @@ public class AStarPathfinder {
         public double gCost; // Cost from start
         public double hCost; // Heuristic cost to goal
         public PathNode parent;
+        public BlockPos buildPos; // Block to place to reach this node
 
         public PathNode(BlockPos pos) {
             this.pos = pos;
             this.gCost = Double.MAX_VALUE;
             this.hCost = 0;
+            this.buildPos = null;
         }
 
         public double fCost() {
@@ -84,16 +86,18 @@ public class AStarPathfinder {
         public final boolean found;
         public final boolean isPartial;
         public final int nodesExplored;
+        public final Map<BlockPos, BlockPos> buildActions; // Node -> Block to place
 
-        public PathResult(List<BlockPos> path, boolean found, boolean isPartial, int nodesExplored) {
+        public PathResult(List<BlockPos> path, boolean found, boolean isPartial, int nodesExplored, Map<BlockPos, BlockPos> buildActions) {
             this.path = path;
             this.found = found;
             this.isPartial = isPartial;
             this.nodesExplored = nodesExplored;
+            this.buildActions = buildActions != null ? buildActions : Collections.emptyMap();
         }
 
         public static PathResult notFound(int nodesExplored) {
-            return new PathResult(Collections.emptyList(), false, false, nodesExplored);
+            return new PathResult(Collections.emptyList(), false, false, nodesExplored, null);
         }
     }
 
@@ -101,16 +105,23 @@ public class AStarPathfinder {
      * Find a path from the mob's position to the target position.
      */
     public static PathResult findPath(Mob mob, BlockPos target) {
-        return findPath(mob, target, false);
+        return findPath(mob, mob.blockPosition(), target, false, false);
     }
 
     public static PathResult findPath(Mob mob, BlockPos target, boolean allowBreaking) {
+        return findPath(mob, mob.blockPosition(), target, allowBreaking, false);
+    }
+
+    public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking) {
+        return findPath(mob, start, target, allowBreaking, false);
+    }
+
+    public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking, boolean allowBuilding) {
         Level level = mob.level();
-        BlockPos start = mob.blockPosition();
 
         // Quick checks
         if (start.equals(target)) {
-            return new PathResult(Collections.singletonList(target), true, false, 0);
+            return new PathResult(Collections.singletonList(target), true, false, 0, null);
         }
 
         // A* algorithm
@@ -141,7 +152,7 @@ public class AStarPathfinder {
 
             // Check if we reached the target (within 2 blocks)
             if (current.pos.closerThan(target, 2.0)) {
-                return new PathResult(reconstructPath(current), true, false, nodesExplored);
+                return reconstructPathResult(current, nodesExplored);
             }
 
             closedSet.add(current.pos);
@@ -154,7 +165,7 @@ public class AStarPathfinder {
                 // 1. Try Standard Move (Walk / Climb)
                 if (isValidMove(level, current.pos, neighborPos, mob, allowBreaking)) {
                     processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob, false,
-                            allowBreaking);
+                            allowBreaking, null);
                 }
                 // 2. Try Drop Move (Walk off, fall to ground)
                 else {
@@ -172,7 +183,7 @@ public class AStarPathfinder {
                                     // Connect Current -> Landing.
                                     // Add cost based on distance
                                     processNeighbor(current, landing, level, openSet, closedSet, allNodes, target, mob,
-                                            false, allowBreaking);
+                                            false, allowBreaking, null);
                                     break; // Only register the first solid landing
                                 }
                                 BlockState s = level.getBlockState(landing);
@@ -182,6 +193,35 @@ public class AStarPathfinder {
                             }
                         }
                     }
+                }
+
+                // 3. Try Building Moves (Bridge)
+                if (allowBuilding) {
+                    // Bridging: Horizontal move, neighbor is air, neighbor.below() is air
+                    // We place a block at neighbor.below()
+                    int dy = neighborPos.getY() - current.pos.getY();
+                    if (dy == 0) { // Horizontal
+                        if (isPassable(level, neighborPos, allowBreaking)
+                                && hasHeadroom(level, neighborPos, allowBreaking)) {
+                            BlockPos bridgeBlock = neighborPos.below();
+                            if (level.getBlockState(bridgeBlock).isAir()
+                                    || level.getBlockState(bridgeBlock).liquid()) {
+                                // We can bridge here
+                                processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob,
+                                        false, allowBreaking, bridgeBlock);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 4. Try Building Moves (Pillar Up)
+            if (allowBuilding) {
+                BlockPos up = current.pos.above();
+                if (isPassable(level, up, allowBreaking) && isPassable(level, up.above(), allowBreaking)) {
+                    // We can pillar up by placing a block at current.pos (jumping up)
+                    // We arrive at 'up'. The block to place is 'current.pos'.
+                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, mob, true, allowBreaking, current.pos);
                 }
             }
 
@@ -194,35 +234,61 @@ public class AStarPathfinder {
 
                 if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking)) {
                     processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, mob, true,
-                            allowBreaking);
+                            allowBreaking, null);
                 }
             }
         }
 
         // Check if we found a partial path
         if (closestNode != startNode && !closestNode.pos.equals(start)) {
-            return new PathResult(reconstructPath(closestNode), false, true, nodesExplored);
+            return reconstructPathResult(closestNode, nodesExplored);
         }
 
         return PathResult.notFound(nodesExplored);
+    }
+    
+    private static PathResult reconstructPathResult(PathNode goal, int nodesExplored) {
+        List<BlockPos> path = new ArrayList<>();
+        Map<BlockPos, BlockPos> buildActions = new HashMap<>();
+        PathNode current = goal;
+
+        while (current != null && path.size() < MAX_PATH_LENGTH) {
+            path.add(current.pos);
+            if (current.buildPos != null) {
+                buildActions.put(current.pos, current.buildPos);
+            }
+            current = current.parent;
+        }
+
+        Collections.reverse(path);
+        return new PathResult(path, true, false, nodesExplored, buildActions);
     }
 
     private static void processNeighbor(PathNode current, BlockPos neighborPos, Level level,
             PriorityQueue<PathNode> openSet,
             Set<BlockPos> closedSet, Map<BlockPos, PathNode> allNodes, BlockPos target, Mob mob, boolean isJump,
-            boolean allowBreaking) {
+            boolean allowBreaking, BlockPos buildBlock) {
         if (closedSet.contains(neighborPos)) {
             return;
         }
 
         // Check if this movement is valid (Standard or Jump already validated)
-        if (!isJump && !isValidMove(level, current.pos, neighborPos, mob, allowBreaking)) {
+        // If building, we skip isValidMove because we are creating the valid condition
+        if (buildBlock == null && !isJump && !isValidMove(level, current.pos, neighborPos, mob, allowBreaking)) {
             return;
         }
 
         double moveCost = calculateMoveCost(level, current.pos, neighborPos, allowBreaking);
         if (isJump)
             moveCost += 0.5; // Jump penalty
+
+        if (buildBlock != null) {
+            moveCost += 10.0; // Building penalty (make it expensive so they prefer walking)
+            // Pillar penalty
+            if (neighborPos.getY() > current.pos.getY()) {
+                moveCost += 5.0; // Extra cost for pillaring up
+            }
+        }
 
         double tentativeG = current.gCost + moveCost;
 
@@ -232,6 +298,7 @@ public class AStarPathfinder {
             neighborNode.parent = current;
             neighborNode.gCost = tentativeG;
             neighborNode.hCost = heuristic(neighborPos, target);
+            neighborNode.buildPos = buildBlock;
 
             // Remove and re-add to update priority
             openSet.remove(neighborNode);
@@ -472,21 +539,5 @@ public class AStarPathfinder {
     private static boolean isBreakable(Level level, BlockPos pos) {
         BlockState state = level.getBlockState(pos);
         return !state.isAir() && state.getDestroySpeed(level, pos) >= 0;
-    }
-
-    /**
-     * Reconstruct the path from goal back to start
-     */
-    private static List<BlockPos> reconstructPath(PathNode goal) {
-        List<BlockPos> path = new ArrayList<>();
-        PathNode current = goal;
-
-        while (current != null && path.size() < MAX_PATH_LENGTH) {
-            path.add(current.pos);
-            current = current.parent;
-        }
-
-        Collections.reverse(path);
-        return path;
     }
 }

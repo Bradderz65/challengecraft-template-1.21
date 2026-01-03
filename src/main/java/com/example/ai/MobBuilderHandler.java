@@ -70,6 +70,11 @@ public class MobBuilderHandler {
         if (mob.level().isClientSide)
             return;
 
+        // If already building, don't restart unless explicitly cancelled
+        if (isBuilding(mob)) {
+            return;
+        }
+
         List<BlockPos> plan = calculatePillarPlan(mob, targetPos);
         if (plan.isEmpty())
             return;
@@ -79,6 +84,14 @@ public class MobBuilderHandler {
 
         // Sync to clients for debug rendering
         BuildPlanData.setBuildPlan(mob.getUUID(), plan);
+    }
+
+    /**
+     * Get the target position the mob is currently building towards
+     */
+    public static BlockPos getPlannedTarget(Mob mob) {
+        BuildingState state = buildingStates.get(mob.getUUID());
+        return state != null ? state.lockedTargetPos : null;
     }
 
     /**
@@ -186,6 +199,15 @@ public class MobBuilderHandler {
 
         // Check if mob is close enough to place the block
         double distSq = mob.blockPosition().distSqr(nextBlock);
+
+        // Refresh debug plan every second to prevent expiry while moving
+        if (mob.tickCount % 20 == 0) {
+            List<BlockPos> remaining = state.blocksToPlace.subList(
+                    state.currentIndex,
+                    state.blocksToPlace.size());
+            BuildPlanData.setBuildPlan(mobId, remaining);
+        }
+
         if (distSq > PLACEMENT_RANGE_SQ) {
             // Mob needs to move closer - reset timer until in range
             state.ticksSinceLastPlace = 0;

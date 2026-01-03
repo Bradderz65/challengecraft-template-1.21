@@ -34,12 +34,15 @@ public class MobPathManager {
         public final long timestamp;
         public int currentNodeIndex;
         public final BlockPos targetPos;
+        public final Map<BlockPos, BlockPos> buildActions;
+        public int placeDelay = 0;
 
-        public CachedPath(List<BlockPos> path, BlockPos targetPos) {
+        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions) {
             this.path = path;
             this.timestamp = System.currentTimeMillis();
             this.currentNodeIndex = 0;
             this.targetPos = targetPos;
+            this.buildActions = buildActions != null ? buildActions : Collections.emptyMap();
         }
 
         public boolean isExpired() {
@@ -99,49 +102,60 @@ public class MobPathManager {
                 || cached.isComplete()
                 || !cached.targetPos.closerThan(targetPos, 5); // Target moved significantly
 
-        // Check if mob is currently building (tick building every frame, not just
-        // during recalc)
-        if (MobBuilderHandler.isBuilding(mob)) {
-            boolean stillBuilding = MobBuilderHandler.tickBuilding(mob, targetPos);
-            if (stillBuilding) {
-                return true; // Mob is building, don't do pathfinding
-            }
-            // Building complete, try pathfinding again
-        }
-
         if (needsRecalculation) {
             // Only recalculate on certain ticks to avoid lag
             if (mob.tickCount % 10 == 0) {
                 // Try standard path first
                 AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
 
-                // If not found, try destructive pathfinding
-                if (!result.found && !result.isPartial) {
-                    result = AStarPathfinder.findPath(mob, targetPos, true);
+                // If not found, try destructive pathfinding (breaking)
+                if (!result.found) {
+                    AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
+                    if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
+                        result = destructiveResult;
+                    }
+                }
+                
+                // If still not found, try BUILDING pathfinding
+                if (!result.found) {
+                     AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
+                     if (buildResult.found || (buildResult.isPartial && !result.isPartial)) {
+                         result = buildResult;
+                     }
                 }
 
-                if ((result.found || result.isPartial) && !result.path.isEmpty()) {
-                    cached = new CachedPath(result.path, targetPos);
+                if (result.found && !result.path.isEmpty()) {
+                    cached = new CachedPath(result.path, targetPos, result.buildActions);
                     pathCache.put(mob.getUUID(), cached);
 
-                    // Path found, sync to clients and clear any building state
+                    // Path found, sync to clients
                     syncPathToClients(mob, result.path);
-                    MobBuilderHandler.cancelBuilding(mob); // Cancel building if path found
+                    
+                    // Sync build plan to clients if any
+                    if (!result.buildActions.isEmpty()) {
+                        BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
+                    } else {
+                        BuildPlanData.removeBuildPlan(mob.getUUID());
+                    }
+                    
                 } else {
-                    // A* couldn't find a path - check if we should build
-                    // Only start building if not already recently completed a build
-                    if (MobBuilderHandler.shouldBuild(mob, targetPos, true) &&
-                            !MobBuilderHandler.recentlyBuilt(mob)) {
-                        // Start building a pillar to reach the target
-                        MobBuilderHandler.startBuilding(mob, targetPos);
+                    // Fallback to partial path if available
+                    if (result.isPartial && !result.path.isEmpty()) {
+                        cached = new CachedPath(result.path, targetPos, result.buildActions);
+                        pathCache.put(mob.getUUID(), cached);
+                        syncPathToClients(mob, result.path);
+                        if (!result.buildActions.isEmpty()) {
+                            BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
+                        } else {
+                            BuildPlanData.removeBuildPlan(mob.getUUID());
+                        }
+                    } else {
+                        // Completely failed
                         pathCache.remove(mob.getUUID());
                         clearClientPath(mob);
-                        return true;
+                        BuildPlanData.removeBuildPlan(mob.getUUID());
+                        return false;
                     }
-                    // Fall back to vanilla
-                    pathCache.remove(mob.getUUID());
-                    clearClientPath(mob);
-                    return false;
                 }
             } else if (cached == null) {
                 return false;
@@ -151,7 +165,43 @@ public class MobPathManager {
         // Follow the path
         if (cached != null && !cached.isComplete()) {
             BlockPos nextNode = cached.getNextNode();
+            
+            // Refresh debug plan periodically
+            if (mob.tickCount % 20 == 0 && !cached.buildActions.isEmpty()) {
+                 BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
+            }
+            
             if (nextNode != null) {
+                // Check if we need to BUILD to reach nextNode
+                BlockPos buildTarget = cached.buildActions.get(nextNode);
+                if (buildTarget != null) {
+                     // We need to place a block at buildTarget
+                     BlockState state = mob.level().getBlockState(buildTarget);
+                     if (state.canBeReplaced()) {
+                         // Need to place
+                         mob.getLookControl().setLookAt(buildTarget.getX() + 0.5, buildTarget.getY() + 0.5, buildTarget.getZ() + 0.5);
+                         
+                         // Check range (2 blocks = 4.0 sq distance)
+                         double distSq = mob.blockPosition().distSqr(buildTarget);
+                         if (distSq > 4.0) {
+                             // Too far to place, continue moving towards nextNode (which should be near buildTarget)
+                             // Do not return true here, let the normal movement logic below handle it
+                         } else {
+                             // In range, check delay
+                             if (cached.placeDelay > 0) {
+                                 cached.placeDelay--;
+                                 mob.getNavigation().stop();
+                                 return true;
+                             }
+
+                             // Place block
+                             mob.level().setBlock(buildTarget, net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState(), 3);
+                             cached.placeDelay = 30; // 1.5s delay between placements
+                             return true; // Stay here until placed (next tick)
+                         }
+                     }
+                }
+
                 // Check if mob reached the current node
                 double distToNode = mob.position().distanceToSqr(
                         nextNode.getX() + 0.5,
