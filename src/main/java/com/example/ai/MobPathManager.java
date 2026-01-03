@@ -36,6 +36,10 @@ public class MobPathManager {
         public final BlockPos targetPos;
         public final Map<BlockPos, BlockPos> buildActions;
         public int placeDelay = 0;
+        
+        // Stuck detection
+        public BlockPos lastPos = null;
+        public int stuckTicks = 0;
 
         public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions) {
             this.path = path;
@@ -43,6 +47,24 @@ public class MobPathManager {
             this.currentNodeIndex = 0;
             this.targetPos = targetPos;
             this.buildActions = buildActions != null ? buildActions : Collections.emptyMap();
+        }
+        
+        public void checkStuck(Mob mob, Player target) {
+            BlockPos currentPos = mob.blockPosition();
+            if (lastPos != null && currentPos.equals(lastPos)) {
+                stuckTicks++;
+                if (stuckTicks > 20 && stuckTicks % 40 == 0) { // Log every 2s after being stuck for 1s
+                     if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
+                         BlockPos next = getNextNode();
+                         String buildInfo = (buildActions.containsKey(next) ? " (Needs Build at " + buildActions.get(next) + ")" : "");
+                         ChallengeMod.LOGGER.warn("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}", 
+                             mob.getUUID().toString().substring(0, 4), currentPos, stuckTicks, next, buildInfo);
+                     }
+                }
+            } else {
+                stuckTicks = 0;
+                lastPos = currentPos;
+            }
         }
 
         public boolean isExpired() {
@@ -107,6 +129,7 @@ public class MobPathManager {
             if (mob.tickCount % 10 == 0) {
                 // 1. Try standard path first
                 AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
+                String strategy = "Standard";
 
                 // 2. If not found, try SOFT destructive pathfinding (breaking only weak blocks like dirt/leaves)
                 // Hardness <= 1.0 covers dirt (0.5), sand (0.5), leaves (0.2), wool (0.8), but excludes stone (1.5), wood (2.0)
@@ -114,6 +137,7 @@ public class MobPathManager {
                     AStarPathfinder.PathResult softBreakResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, false, 1.0f);
                     if (softBreakResult.found || (softBreakResult.isPartial && !result.isPartial)) {
                         result = softBreakResult;
+                        strategy = "SoftBreak";
                     }
                 }
                 
@@ -122,6 +146,7 @@ public class MobPathManager {
                      AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
                      if (buildResult.found || (buildResult.isPartial && !result.isPartial)) {
                          result = buildResult;
+                         strategy = "Building";
                      }
                 }
 
@@ -130,12 +155,17 @@ public class MobPathManager {
                     AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
                     if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
                         result = destructiveResult;
+                        strategy = "HardBreak";
                     }
                 }
 
                 if (result.found && !result.path.isEmpty()) {
                     cached = new CachedPath(result.path, targetPos, result.buildActions);
                     pathCache.put(mob.getUUID(), cached);
+                    
+                    if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
+                        ChallengeMod.LOGGER.info("[Path] Mob {} found path using strategy: {} (Nodes: {})", mob.getUUID().toString().substring(0, 4), strategy, result.path.size());
+                    }
 
                     // Path found, sync to clients
                     syncPathToClients(mob, result.path);
@@ -173,6 +203,7 @@ public class MobPathManager {
 
         // Follow the path
         if (cached != null && !cached.isComplete()) {
+            cached.checkStuck(mob, target);
             BlockPos nextNode = cached.getNextNode();
             
             // Refresh debug plan periodically
@@ -195,6 +226,9 @@ public class MobPathManager {
                          if (distSq > 4.0) {
                              // Too far to place, continue moving towards nextNode (which should be near buildTarget)
                              // Do not return true here, let the normal movement logic below handle it
+                             if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0 && mob.distanceTo(target) <= 20.0) {
+                                 ChallengeMod.LOGGER.info("[Building] Mob {} too far to place at {} (Dist: {})", mob.getUUID().toString().substring(0, 4), buildTarget, Math.sqrt(distSq));
+                             }
                          } else {
                              // In range, check delay
                              if (cached.placeDelay > 0) {
@@ -205,7 +239,7 @@ public class MobPathManager {
 
                              // Place block
                              mob.level().setBlock(buildTarget, net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState(), 3);
-                             if (ChallengeMod.isAStarDebugEnabled()) {
+                             if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
                                  ChallengeMod.LOGGER.info("[Action] Mob {} placing block at {}", mob.getUUID().toString().substring(0, 4), buildTarget);
                              }
                              cached.placeDelay = 30; // 1.5s delay between placements
@@ -245,7 +279,7 @@ public class MobPathManager {
                         mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
                                 nextNode.getZ() + 0.5);
                                 
-                        if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
+                        if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
                              BlockState state = mob.level().getBlockState(nextNode);
                              if (!state.blocksMotion()) state = mob.level().getBlockState(nextNode.above());
                              ChallengeMod.LOGGER.info("[Action] Mob {} breaking {} at {}", mob.getUUID().toString().substring(0, 4), state.getBlock().getName().getString(), nextNode);

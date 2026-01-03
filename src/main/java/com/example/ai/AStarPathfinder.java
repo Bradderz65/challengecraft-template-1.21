@@ -232,14 +232,17 @@ public class AStarPathfinder {
 
             // Jumping moves (2 blocks horizontal, over gaps)
             // Only cardinal directions for jumps to keep it simple
-            int[][] jumps = { { 2, 0, 0 }, { -2, 0, 0 }, { 0, 0, 2 }, { 0, 0, -2 } };
-            for (int[] jump : jumps) {
-                BlockPos jumpTarget = current.pos.offset(jump[0], jump[1], jump[2]);
-                BlockPos midPoint = current.pos.offset(jump[0] / 2, jump[1] / 2, jump[2] / 2);
+            // If building is allowed, DISABLE 2-block jumps to force bridging (safer)
+            if (!allowBuilding) {
+                int[][] jumps = { { 2, 0, 0 }, { -2, 0, 0 }, { 0, 0, 2 }, { 0, 0, -2 } };
+                for (int[] jump : jumps) {
+                    BlockPos jumpTarget = current.pos.offset(jump[0], jump[1], jump[2]);
+                    BlockPos midPoint = current.pos.offset(jump[0] / 2, jump[1] / 2, jump[2] / 2);
 
-                if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking, maxHardness)) {
-                    processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, mob, true,
-                            allowBreaking, null, maxHardness);
+                    if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking, maxHardness)) {
+                        processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, mob, true,
+                                allowBreaking, null, maxHardness);
+                    }
                 }
             }
         }
