@@ -53,7 +53,7 @@ public class MobPathManager {
             BlockPos currentPos = mob.blockPosition();
             if (lastPos != null && currentPos.equals(lastPos)) {
                 stuckTicks++;
-                if (stuckTicks > 20 && stuckTicks % 40 == 0) { // Log every 2s after being stuck for 1s
+                if (stuckTicks > 20 && stuckTicks % 100 == 0) { // Log every 5s after being stuck for 1s
                      if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
                          BlockPos next = getNextNode();
                          String buildInfo = (buildActions.containsKey(next) ? " (Needs Build at " + buildActions.get(next) + ")" : "");
@@ -163,7 +163,7 @@ public class MobPathManager {
                     cached = new CachedPath(result.path, targetPos, result.buildActions);
                     pathCache.put(mob.getUUID(), cached);
                     
-                    if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
+                    if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0 && !strategy.equals("Standard") && result.path.size() >= 3) {
                         ChallengeMod.LOGGER.info("[Path] Mob {} found path using strategy: {} (Nodes: {})", mob.getUUID().toString().substring(0, 4), strategy, result.path.size());
                     }
 
@@ -279,10 +279,27 @@ public class MobPathManager {
                         mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
                                 nextNode.getZ() + 0.5);
                                 
-                        if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
-                             BlockState state = mob.level().getBlockState(nextNode);
-                             if (!state.blocksMotion()) state = mob.level().getBlockState(nextNode.above());
-                             ChallengeMod.LOGGER.info("[Action] Mob {} breaking {} at {}", mob.getUUID().toString().substring(0, 4), state.getBlock().getName().getString(), nextNode);
+                        if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0 && mob.tickCount % 20 == 0) {
+                             BlockState feetState = mob.level().getBlockState(nextNode);
+                             BlockState headState = mob.level().getBlockState(nextNode.above());
+                             
+                             float hardness = feetState.getDestroySpeed(mob.level(), nextNode);
+                             float damage = MobBreakerHandler.getBlockDamage(nextNode);
+                             String targetPart = "Feet";
+                             
+                             if (!feetState.blocksMotion() && headState.blocksMotion()) {
+                                 hardness = headState.getDestroySpeed(mob.level(), nextNode.above());
+                                 damage = MobBreakerHandler.getBlockDamage(nextNode.above());
+                                 targetPart = "Head";
+                             }
+                             
+                             ChallengeMod.LOGGER.info("[Action] Mob {} breaking {} (Target: {}) at {} | Hardness: {} | Damage: {}%", 
+                                 mob.getUUID().toString().substring(0, 4), 
+                                 targetPart.equals("Feet") ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(feetState.getBlock()) : net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(headState.getBlock()),
+                                 targetPart,
+                                 nextNode,
+                                 String.format("%.1f", hardness),
+                                 String.format("%.0f", damage * 100));
                         }
                         
                         // Stop moving while breaking

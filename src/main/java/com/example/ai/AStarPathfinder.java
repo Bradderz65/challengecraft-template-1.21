@@ -1,5 +1,6 @@
 package com.example.ai;
 
+import com.example.antitower.MobBreakerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.Level;
@@ -392,13 +393,17 @@ public class AStarPathfinder {
             if (!isPassable(level, to, false, maxHardness)) {
                  BlockState s = level.getBlockState(to);
                  float hardness = s.getDestroySpeed(level, to);
-                 distance += 10.0 + (hardness * 5.0);
+                 float breakCost = 10.0f + (hardness * 5.0f);
+                 float damage = MobBreakerHandler.getBlockDamage(to);
+                 distance += breakCost * (1.0f - damage);
                  if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
             }
             if (!isPassable(level, to.above(), false, maxHardness)) {
                  BlockState s = level.getBlockState(to.above());
                  float hardness = s.getDestroySpeed(level, to.above());
-                 distance += 10.0 + (hardness * 5.0);
+                 float breakCost = 10.0f + (hardness * 5.0f);
+                 float damage = MobBreakerHandler.getBlockDamage(to.above());
+                 distance += breakCost * (1.0f - damage);
                  if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
             }
         }

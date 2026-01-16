@@ -104,6 +104,10 @@ public class MobBreakerHandler {
         }
     }
 
+    public static float getBlockDamage(BlockPos pos) {
+        return blockDamage.getOrDefault(pos, 0f);
+    }
+
     public static void clearAll() {
         blockDamage.clear();
         // Ideally we would also clear visuals on the server level but we don't have

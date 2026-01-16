@@ -67,12 +67,6 @@ public class AntiTowerHandler {
         // Count player-placed blocks directly below player
         List<BlockPos> towerBlocks = getPlayerBlocksBelowPlayer(player, placedBlocks);
 
-        // Debug log
-        if (player.tickCount % 40 == 0) {
-            ChallengeMod.LOGGER.info("[AntiTower] {} has {} of their blocks below them",
-                    player.getName().getString(), towerBlocks.size());
-        }
-
         if (towerBlocks.size() >= MIN_TOWER_HEIGHT) {
             // Tower detected!
             if (!towerDetectedTime.containsKey(playerId)) {
