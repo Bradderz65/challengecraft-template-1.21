@@ -3,6 +3,7 @@ package com.example.mixin;
 import com.example.ChallengeMod;
 import com.example.ai.HuntRules;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
@@ -91,6 +92,11 @@ public abstract class MobEntityMixin {
 		}
 
 		if (target == null) {
+			// If we have no valid player target, but we are currently targeting a player
+			// (e.g. they switched to Creative), we must clear it.
+			if (mob.getTarget() instanceof Player) {
+				mob.setTarget(null);
+			}
 			// debugLog(mob, "aiStep target=none");
 			return;
 		}
@@ -121,6 +127,9 @@ public abstract class MobEntityMixin {
 			if (cachedPath != null && !cachedPath.isComplete()) {
 				BlockPos nextNode = cachedPath.getNextNode();
 				if (nextNode != null) {
+					int mobBlockY = mob.blockPosition().getY();
+					int nextNodeY = nextNode.getY();
+					int nextDeltaY = nextNodeY - mobBlockY;
 					double dx = nextNode.getX() + 0.5 - mob.getX();
 					double dz = nextNode.getZ() + 0.5 - mob.getZ();
 					double distSqrHorizontal = dx * dx + dz * dz;
@@ -130,7 +139,7 @@ public abstract class MobEntityMixin {
 					// Jump (2 blocks) is ~2.0 (sqr ~ 4).
 					// If distance > 2.25 (1.5 blocks), it's a gap jump.
 					// Also ensure we are facing it roughly? Or just force velocity.
-					if (distSqrHorizontal > 2.25) {
+					if (distSqrHorizontal > 2.25 && nextDeltaY <= 1) {
 						mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
 								nextNode.getZ() + 0.5);
 						// Jump if on ground (and maybe slightly before edge?)
@@ -190,28 +199,43 @@ public abstract class MobEntityMixin {
 			wallAttraction = wallAttraction.normalize();
 		}
 
-		boolean targetAbove = target.getY() > mob.getY() + 0.5;
-		// If we are hanging on a wall (not on ground) and target is roughly at our
-		// level, maintain height/climb to vault over
-		boolean maintenanceHover = !mob.onGround() && target.getY() > mob.getY() - 1.0;
+		// Determine steering target (Path Node OR Player)
+		// We calculate this early to decide if we need to climb
+		Vec3 steeringTarget = target.position();
+		var cachedPath = com.example.ai.MobPathManager.getCachedPath(mob);
+		if (cachedPath != null && !cachedPath.isComplete()) {
+			BlockPos node = cachedPath.getNextNode();
+			if (node != null) {
+				steeringTarget = new Vec3(node.getX() + 0.5, node.getY(), node.getZ() + 0.5);
+			}
+		}
 
-		if ((mob.horizontalCollision || (mob.level().getBlockState(mob.blockPosition().north()).blocksMotion() ||
-				mob.level().getBlockState(mob.blockPosition().south()).blocksMotion() ||
-				mob.level().getBlockState(mob.blockPosition().east()).blocksMotion() ||
-				mob.level().getBlockState(mob.blockPosition().west()).blocksMotion()))
-				&& (targetAbove || maintenanceHover)) {
+		BlockPos mobBlockPos = mob.blockPosition();
+		int mobBlockY = mobBlockPos.getY();
+		int targetBlockY = (int) Math.floor(steeringTarget.y);
+		int targetDeltaY = targetBlockY - mobBlockY;
+		boolean pathNeedsClimb = targetDeltaY >= 2;
+
+		boolean hasWallFace = false;
+		Direction facing = mob.getDirection();
+		for (int i = 0; i <= 1; i++) {
+			BlockPos checkPos = mobBlockPos.relative(facing).above(i);
+			if (mob.level().getBlockState(checkPos).blocksMotion()) {
+				hasWallFace = true;
+				break;
+			}
+		}
+
+		// Only climb if our IMMEDIATE target is meaningfully above or we are blocked by a wall face.
+		// One-block steps should use normal jumping.
+		boolean targetAbove = pathNeedsClimb || (targetDeltaY >= 1 && hasWallFace);
+
+		// Only maintain height while already climbing if we're still headed upward or blocked for an upward move.
+		boolean maintenanceHover = !mob.onGround() && (pathNeedsClimb || (targetDeltaY >= 1 && hasWallFace));
+
+		if ((mob.horizontalCollision || isNextToWall) && (targetAbove || maintenanceHover)) {
 			Vec3 motion = mob.getDeltaMovement();
 			if (motion.y < 0.2) {
-				// Determine steering target (Path Node OR Player)
-				Vec3 steeringTarget = target.position();
-				var cachedPath = com.example.ai.MobPathManager.getCachedPath(mob);
-				if (cachedPath != null && !cachedPath.isComplete()) {
-					BlockPos node = cachedPath.getNextNode();
-					if (node != null) {
-						steeringTarget = new Vec3(node.getX() + 0.5, node.getY(), node.getZ() + 0.5);
-					}
-				}
-
 				// "Wall Suction": Adjust steering target to be CLOSER to the wall, not center
 				// of air block.
 				// This prevents mobs from pulling themselves off the wall to reach the center

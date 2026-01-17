@@ -390,21 +390,30 @@ public class AStarPathfinder {
 
         if (allowBreaking) {
             // Cost based on block hardness
+            // Dramatically increased hardness penalty (5.0 -> 20.0) to force finding weak spots
             if (!isPassable(level, to, false, maxHardness)) {
-                 BlockState s = level.getBlockState(to);
-                 float hardness = s.getDestroySpeed(level, to);
-                 float breakCost = 10.0f + (hardness * 5.0f);
-                 float damage = MobBreakerHandler.getBlockDamage(to);
-                 distance += breakCost * (1.0f - damage);
-                 if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+                 if (MobPathManager.isPlannedBreach(to)) {
+                     distance += 2.0; // Swarm Magnet: Treat planned breaches as almost air
+                 } else {
+                     BlockState s = level.getBlockState(to);
+                     float hardness = s.getDestroySpeed(level, to);
+                     float breakCost = 10.0f + (hardness * 20.0f);
+                     float damage = MobBreakerHandler.getBlockDamage(to);
+                     distance += breakCost * (1.0f - damage);
+                     if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+                 }
             }
             if (!isPassable(level, to.above(), false, maxHardness)) {
-                 BlockState s = level.getBlockState(to.above());
-                 float hardness = s.getDestroySpeed(level, to.above());
-                 float breakCost = 10.0f + (hardness * 5.0f);
-                 float damage = MobBreakerHandler.getBlockDamage(to.above());
-                 distance += breakCost * (1.0f - damage);
-                 if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+                 if (MobPathManager.isPlannedBreach(to.above())) {
+                     distance += 2.0; // Swarm Magnet: Treat planned breaches as almost air
+                 } else {
+                     BlockState s = level.getBlockState(to.above());
+                     float hardness = s.getDestroySpeed(level, to.above());
+                     float breakCost = 10.0f + (hardness * 20.0f);
+                     float damage = MobBreakerHandler.getBlockDamage(to.above());
+                     distance += breakCost * (1.0f - damage);
+                     if (s.is(Blocks.COBBLESTONE)) distance += 500.0; // Don't break own pillars
+                 }
             }
         }
 

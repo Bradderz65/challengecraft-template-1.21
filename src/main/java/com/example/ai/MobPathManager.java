@@ -25,12 +25,41 @@ public class MobPathManager {
 
     // Maximum distance to use A* (beyond this, use normal navigation)
     private static final double MAX_ASTAR_DISTANCE = 50.0;
+    
+    // Global throttling to prevent server overload
+    private static int pathCalcsPerTick = 0;
+    private static long lastTick = 0;
+    
+    // Swarm Intelligence: Track planned breaches so other mobs can route through them
+    public static final Map<BlockPos, Long> plannedBreaches = new ConcurrentHashMap<>();
+
+    /**
+     * Register a planned breach at a position
+     */
+    public static void registerBreach(BlockPos pos) {
+        plannedBreaches.put(pos, System.currentTimeMillis());
+    }
+
+    /**
+     * Check if a block is a planned breach (targeted by another mob)
+     */
+    public static boolean isPlannedBreach(BlockPos pos) {
+        Long timestamp = plannedBreaches.get(pos);
+        if (timestamp == null) return false;
+        // Expires after 15 seconds
+        if (System.currentTimeMillis() - timestamp > 15000) {
+            plannedBreaches.remove(pos);
+            return false;
+        }
+        return true;
+    }
 
     /**
      * Cached path data for a mob
      */
     public static class CachedPath {
         public final List<BlockPos> path;
+        public final String strategy;
         public final long timestamp;
         public int currentNodeIndex;
         public final BlockPos targetPos;
@@ -40,13 +69,16 @@ public class MobPathManager {
         // Stuck detection
         public BlockPos lastPos = null;
         public int stuckTicks = 0;
+        public long lastCheckTime = 0;
 
-        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions) {
+        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy) {
             this.path = path;
+            this.strategy = strategy;
             this.timestamp = System.currentTimeMillis();
             this.currentNodeIndex = 0;
             this.targetPos = targetPos;
             this.buildActions = buildActions != null ? buildActions : Collections.emptyMap();
+            this.lastCheckTime = timestamp;
         }
         
         public void checkStuck(Mob mob, Player target) {
@@ -68,7 +100,9 @@ public class MobPathManager {
         }
 
         public boolean isExpired() {
-            return System.currentTimeMillis() - timestamp > RECALCULATE_INTERVAL * 50; // Convert to ms
+            // Paths last longer now (10-14 seconds) to spread load
+            long offset = Math.abs(this.hashCode()) % 4000;
+            return System.currentTimeMillis() - timestamp > (10000 + offset);
         }
 
         public BlockPos getNextNode() {
@@ -76,6 +110,11 @@ public class MobPathManager {
                 return null;
             }
             return path.get(currentNodeIndex);
+        }
+        
+        public BlockPos getFinalNode() {
+            if (path.isEmpty()) return null;
+            return path.get(path.size() - 1);
         }
 
         public void advanceNode() {
@@ -93,17 +132,29 @@ public class MobPathManager {
      * @return true if A* pathfinding is active and handling movement
      */
     public static boolean updatePathfinding(Mob mob, Player target) {
-        if (!ChallengeMod.isAStarEnabled()) {
+        if (!ChallengeMod.isAStarEnabled() || target == null || target.isCreative() || target.isSpectator()) {
+            if (pathCache.containsKey(mob.getUUID())) {
+                pathCache.remove(mob.getUUID());
+                clearClientPath(mob);
+                BuildPlanData.removeBuildPlan(mob.getUUID());
+            }
             return false;
         }
 
         if (mob.level().isClientSide) {
             return false;
         }
+        
+        // Update throttling counter
+        long currentTick = mob.level().getGameTime();
+        if (currentTick != lastTick) {
+            lastTick = currentTick;
+            pathCalcsPerTick = 0;
+        }
 
         double distance = mob.distanceTo(target);
 
-        // For very close ranges, don't use A* (unless we are touching the player)
+        // For very close ranges, don't use A*
         if (distance < 1.5) {
             pathCache.remove(mob.getUUID());
             return false;
@@ -121,82 +172,91 @@ public class MobPathManager {
         // Check if we need to recalculate the path
         boolean needsRecalculation = cached == null
                 || cached.isExpired()
-                || cached.isComplete()
-                || !cached.targetPos.closerThan(targetPos, 5); // Target moved significantly
+                || cached.isComplete();
+        
+        if (cached != null && !needsRecalculation) {
+            // Target moved far from path end?
+            BlockPos finalNode = cached.getFinalNode();
+            if (finalNode != null && !finalNode.closerThan(targetPos, 3.5)) {
+                needsRecalculation = true;
+            }
+            
+            // Periodically check for easier paths if currently breaking/building
+            if (!cached.strategy.equals("Standard") && System.currentTimeMillis() - cached.lastCheckTime > 2000) {
+                needsRecalculation = true;
+            }
+        }
 
         if (needsRecalculation) {
-            // Only recalculate on certain ticks to avoid lag
-            if (mob.tickCount % 10 == 0) {
-                // 1. Try standard path first
-                AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
-                String strategy = "Standard";
-
-                // 2. If not found, try SOFT destructive pathfinding (breaking only weak blocks like dirt/leaves)
-                // Hardness <= 1.0 covers dirt (0.5), sand (0.5), leaves (0.2), wool (0.8), but excludes stone (1.5), wood (2.0)
-                if (!result.found) {
-                    AStarPathfinder.PathResult softBreakResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, false, 1.0f);
-                    if (softBreakResult.found || (softBreakResult.isPartial && !result.isPartial)) {
-                        result = softBreakResult;
-                        strategy = "SoftBreak";
-                    }
-                }
-                
-                // 3. If still not found, try BUILDING pathfinding (bridge/pillar)
-                if (!result.found) {
-                     AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
-                     if (buildResult.found || (buildResult.isPartial && !result.isPartial)) {
-                         result = buildResult;
-                         strategy = "Building";
-                     }
-                }
-
-                // 4. If still not found, try HARD destructive pathfinding (breaking anything)
-                if (!result.found) {
-                    AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
-                    if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
-                        result = destructiveResult;
-                        strategy = "HardBreak";
-                    }
-                }
-
-                if (result.found && !result.path.isEmpty()) {
-                    cached = new CachedPath(result.path, targetPos, result.buildActions);
-                    pathCache.put(mob.getUUID(), cached);
+            // Throttling Check
+            if (pathCalcsPerTick < 2) {
+                if (mob.tickCount % 10 == 0 || cached == null) {
+                    pathCalcsPerTick++;
                     
-                    if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0 && !strategy.equals("Standard") && result.path.size() >= 3) {
-                        ChallengeMod.LOGGER.info("[Path] Mob {} found path using strategy: {} (Nodes: {})", mob.getUUID().toString().substring(0, 4), strategy, result.path.size());
-                    }
+                    AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
+                    String strategy = "Standard";
 
-                    // Path found, sync to clients
-                    syncPathToClients(mob, result.path);
-                    
-                    // Sync build plan to clients if any
-                    if (!result.buildActions.isEmpty()) {
-                        BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
-                    } else {
-                        BuildPlanData.removeBuildPlan(mob.getUUID());
+                    if (!result.found) {
+                        AStarPathfinder.PathResult softBreakResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, false, 1.0f);
+                        if (softBreakResult.found || (softBreakResult.isPartial && !result.isPartial)) {
+                            result = softBreakResult;
+                            strategy = "SoftBreak";
+                        }
                     }
                     
-                } else {
-                    // Fallback to partial path if available
-                    if (result.isPartial && !result.path.isEmpty()) {
-                        cached = new CachedPath(result.path, targetPos, result.buildActions);
+                    if (!result.found) {
+                         AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
+                         if (buildResult.found || (buildResult.isPartial && !result.isPartial)) {
+                             result = buildResult;
+                             strategy = "Building";
+                         }
+                    }
+
+                    if (!result.found) {
+                        AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
+                        if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
+                            result = destructiveResult;
+                            strategy = "HardBreak";
+                        }
+                    }
+
+                    if (result.found && !result.path.isEmpty()) {
+                        boolean keepOldPath = (cached != null && cached.strategy.equals(strategy));
+                        if (keepOldPath) {
+                            cached.lastCheckTime = System.currentTimeMillis();
+                        } else {
+                            cached = new CachedPath(result.path, targetPos, result.buildActions, strategy);
+                            pathCache.put(mob.getUUID(), cached);
+                            
+                            // Broadcast breaches
+                            for (BlockPos node : result.path) {
+                                if (isSolid(mob.level(), node)) registerBreach(node);
+                                if (isSolid(mob.level(), node.above())) registerBreach(node.above());
+                            }
+
+                            syncPathToClients(mob, result.path);
+                            if (!result.buildActions.isEmpty()) {
+                                BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
+                            } else {
+                                BuildPlanData.removeBuildPlan(mob.getUUID());
+                            }
+                        }
+                    } else if (result.isPartial && !result.path.isEmpty()) {
+                        cached = new CachedPath(result.path, targetPos, result.buildActions, strategy);
                         pathCache.put(mob.getUUID(), cached);
                         syncPathToClients(mob, result.path);
-                        if (!result.buildActions.isEmpty()) {
-                            BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
-                        } else {
-                            BuildPlanData.removeBuildPlan(mob.getUUID());
-                        }
                     } else {
-                        // Completely failed
                         pathCache.remove(mob.getUUID());
                         clearClientPath(mob);
                         BuildPlanData.removeBuildPlan(mob.getUUID());
                         return false;
                     }
                 }
-            } else if (cached == null) {
+            }
+            
+            if (cached != null) {
+                cached.lastCheckTime = System.currentTimeMillis();
+            } else {
                 return false;
             }
         }
@@ -206,134 +266,64 @@ public class MobPathManager {
             cached.checkStuck(mob, target);
             BlockPos nextNode = cached.getNextNode();
             
-            // Refresh debug plan periodically
             if (mob.tickCount % 20 == 0 && !cached.buildActions.isEmpty()) {
                  BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
             }
             
             if (nextNode != null) {
-                // Check if we need to BUILD to reach nextNode
                 BlockPos buildTarget = cached.buildActions.get(nextNode);
                 if (buildTarget != null) {
-                     // We need to place a block at buildTarget
                      BlockState state = mob.level().getBlockState(buildTarget);
                      if (state.canBeReplaced()) {
-                         // Need to place
                          mob.getLookControl().setLookAt(buildTarget.getX() + 0.5, buildTarget.getY() + 0.5, buildTarget.getZ() + 0.5);
-                         
-                         // Check range (2 blocks = 4.0 sq distance)
                          double distSq = mob.blockPosition().distSqr(buildTarget);
-                         if (distSq > 4.0) {
-                             // Too far to place, continue moving towards nextNode (which should be near buildTarget)
-                             // Do not return true here, let the normal movement logic below handle it
-                             if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0 && mob.distanceTo(target) <= 20.0) {
-                                 ChallengeMod.LOGGER.info("[Building] Mob {} too far to place at {} (Dist: {})", mob.getUUID().toString().substring(0, 4), buildTarget, Math.sqrt(distSq));
-                             }
-                         } else {
-                             // In range, check delay
+                         if (distSq <= 4.0) {
                              if (cached.placeDelay > 0) {
                                  cached.placeDelay--;
                                  mob.getNavigation().stop();
                                  return true;
                              }
-
-                             // Place block
                              mob.level().setBlock(buildTarget, net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState(), 3);
-                             if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
-                                 ChallengeMod.LOGGER.info("[Action] Mob {} placing block at {}", mob.getUUID().toString().substring(0, 4), buildTarget);
-                             }
-                             cached.placeDelay = 30; // 1.5s delay between placements
-                             return true; // Stay here until placed (next tick)
+                             cached.placeDelay = 30;
+                             return true;
                          }
                      }
                 }
 
-                // Check if mob reached the current node
-                double distToNode = mob.position().distanceToSqr(
-                        nextNode.getX() + 0.5,
-                        nextNode.getY(),
-                        nextNode.getZ() + 0.5);
-
+                double distToNode = mob.position().distanceToSqr(nextNode.getX() + 0.5, nextNode.getY(), nextNode.getZ() + 0.5);
                 if (distToNode < 1.5) {
                     cached.advanceNode();
                     nextNode = cached.getNextNode();
                 }
 
                 if (nextNode != null) {
-                    // Check for obstructions (Block Breaking Logic)
                     boolean isBlocked = false;
-
-                    // Check feet level
                     if (isSolid(mob.level(), nextNode)) {
                         MobBreakerHandler.tickBreaking(mob, nextNode);
                         isBlocked = true;
                     }
-                    // Check head level
                     if (isSolid(mob.level(), nextNode.above())) {
                         MobBreakerHandler.tickBreaking(mob, nextNode.above());
                         isBlocked = true;
                     }
 
                     if (isBlocked) {
-                        // Look at the block we are breaking
-                        mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
-                                nextNode.getZ() + 0.5);
-                                
-                        if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0 && mob.tickCount % 20 == 0) {
-                             BlockState feetState = mob.level().getBlockState(nextNode);
-                             BlockState headState = mob.level().getBlockState(nextNode.above());
-                             
-                             float hardness = feetState.getDestroySpeed(mob.level(), nextNode);
-                             float damage = MobBreakerHandler.getBlockDamage(nextNode);
-                             String targetPart = "Feet";
-                             
-                             if (!feetState.blocksMotion() && headState.blocksMotion()) {
-                                 hardness = headState.getDestroySpeed(mob.level(), nextNode.above());
-                                 damage = MobBreakerHandler.getBlockDamage(nextNode.above());
-                                 targetPart = "Head";
-                             }
-                             
-                             ChallengeMod.LOGGER.info("[Action] Mob {} breaking {} (Target: {}) at {} | Hardness: {} | Damage: {}%", 
-                                 mob.getUUID().toString().substring(0, 4), 
-                                 targetPart.equals("Feet") ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(feetState.getBlock()) : net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(headState.getBlock()),
-                                 targetPart,
-                                 nextNode,
-                                 String.format("%.1f", hardness),
-                                 String.format("%.0f", damage * 100));
-                        }
-                        
-                        // Stop moving while breaking
+                        mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5, nextNode.getZ() + 0.5);
                         mob.getNavigation().stop();
                         return true;
                     }
 
-                    // Move towards the next node
                     double speed = ChallengeMod.getSpeedMultiplier();
+                    if (nextNode.getY() < mob.getY() - 0.2) speed *= 0.5;
 
-                    // Slow down if the next node is below us (drop) to prevent flying off
-                    if (nextNode.getY() < mob.getY() - 0.2) {
-                        speed *= 0.5;
+                    mob.getMoveControl().setWantedPosition(nextNode.getX() + 0.5, nextNode.getY(), nextNode.getZ() + 0.5, speed);
+                    if (nextNode.getY() > mob.getY() + 0.5 && mob.onGround()) {
+                        mob.getJumpControl().jump();
                     }
-
-                    // Use MoveControl instead of Navigation to prevent stuttering/re-pathing every tick
-                    mob.getMoveControl().setWantedPosition(
-                            nextNode.getX() + 0.5,
-                            nextNode.getY(),
-                            nextNode.getZ() + 0.5,
-                            speed);
-
-                    // Handle jumping
-                    if (nextNode.getY() > mob.getY() + 0.5) {
-                        if (mob.onGround()) {
-                            mob.getJumpControl().jump();
-                        }
-                    }
-
                     return true;
                 }
             }
         }
-
         return false;
     }
 
@@ -342,43 +332,26 @@ public class MobPathManager {
         return state.blocksMotion();
     }
 
-    /**
-     * Sync path data to clients for debug rendering
-     */
     private static void syncPathToClients(Mob mob, List<BlockPos> path) {
-        // Store the path in a static map that the client can access
-        // The client will render this during debug mode
         PathDebugData.setMobPath(mob.getUUID(), path);
     }
 
-    /**
-     * Clear path data on clients
-     */
     private static void clearClientPath(Mob mob) {
         PathDebugData.removeMobPath(mob.getUUID());
     }
 
-    /**
-     * Clean up when a mob is removed
-     */
     public static void onMobRemoved(Mob mob) {
         pathCache.remove(mob.getUUID());
         PathDebugData.removeMobPath(mob.getUUID());
         MobBuilderHandler.onMobRemoved(mob);
     }
 
-    /**
-     * Clear all cached paths
-     */
     public static void clearAll() {
         pathCache.clear();
         PathDebugData.clearAll();
         MobBuilderHandler.clearAll();
     }
 
-    /**
-     * Get the cached path for a mob (for debug rendering)
-     */
     public static CachedPath getCachedPath(Mob mob) {
         return pathCache.get(mob.getUUID());
     }

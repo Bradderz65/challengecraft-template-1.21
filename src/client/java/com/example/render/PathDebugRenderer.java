@@ -140,17 +140,27 @@ public class PathDebugRenderer {
             BlockPos pos = path.get(i);
             
             // Check if block is solid (needs breaking)
-            boolean isSolid = Minecraft.getInstance().level.getBlockState(pos).blocksMotion();
+            boolean isFeetSolid = Minecraft.getInstance().level.getBlockState(pos).blocksMotion();
+            boolean isHeadSolid = Minecraft.getInstance().level.getBlockState(pos.above()).blocksMotion();
 
-            if (isSolid) {
-                // Render full-size red wireframe for break targets
+            if (isFeetSolid) {
+                // Render full-size red wireframe for feet break targets
                 renderBlockMarker(poseStack, bufferSource, pos, BREAK_COLOR, 0.005f);
-            } else if (i == 0) {
-                renderNodeMarker(poseStack, bufferSource, pos, START_COLOR, 0.3f);
-            } else if (i == path.size() - 1) {
-                renderNodeMarker(poseStack, bufferSource, pos, END_COLOR, 0.3f);
-            } else {
-                renderNodeMarker(poseStack, bufferSource, pos, NODE_COLOR, 0.15f);
+            }
+            
+            if (isHeadSolid) {
+                // Render full-size red wireframe for head break targets
+                renderBlockMarker(poseStack, bufferSource, pos.above(), BREAK_COLOR, 0.005f);
+            }
+            
+            if (!isFeetSolid && !isHeadSolid) {
+                if (i == 0) {
+                    renderNodeMarker(poseStack, bufferSource, pos, START_COLOR, 0.3f);
+                } else if (i == path.size() - 1) {
+                    renderNodeMarker(poseStack, bufferSource, pos, END_COLOR, 0.3f);
+                } else {
+                    renderNodeMarker(poseStack, bufferSource, pos, NODE_COLOR, 0.15f);
+                }
             }
         }
     }
