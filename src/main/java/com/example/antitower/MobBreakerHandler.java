@@ -4,6 +4,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -19,6 +20,9 @@ public class MobBreakerHandler {
 
     public static void handleMobBreaking(Mob mob, Player target) {
         if (mob.level().isClientSide)
+            return;
+
+        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
             return;
 
         // Check every 5 ticks to avoid excessive raycasting
@@ -62,6 +66,9 @@ public class MobBreakerHandler {
     public static boolean tickBreaking(Mob mob, BlockPos pos) {
         if (mob.level().isClientSide)
             return false;
+
+        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
+            return false;
         BlockState state = mob.level().getBlockState(pos);
         if (state.isAir())
             return true;
@@ -83,6 +90,8 @@ public class MobBreakerHandler {
 
     public static void applyDamage(ServerLevel level, BlockPos pos, net.minecraft.world.entity.Entity breaker,
             float amount) {
+        if (!level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
+            return;
         float currentDamage = blockDamage.getOrDefault(pos, 0f);
         currentDamage += amount;
 

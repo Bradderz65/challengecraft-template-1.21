@@ -16,8 +16,8 @@ import java.util.*;
  */
 public class AStarPathfinder {
 
-    private static final int MAX_NODES = 3000; // Maximum nodes to explore (Reduced to prevent stutter)
-    private static final int MAX_PATH_LENGTH = 200; // Maximum path length
+    private static final int MAX_NODES = 1500; // Maximum nodes to explore (Reduced to prevent stutter)
+    private static final int MAX_PATH_LENGTH = 120; // Maximum path length
 
     // Directions for neighbor exploration (including diagonals and vertical)
     private static final int[][] DIRECTIONS = {
@@ -392,7 +392,7 @@ public class AStarPathfinder {
             // Cost based on block hardness
             // Dramatically increased hardness penalty (5.0 -> 20.0) to force finding weak spots
             if (!isPassable(level, to, false, maxHardness)) {
-                 if (MobPathManager.isPlannedBreach(to)) {
+                 if (MobPathManager.isPlannedBreach(level, to)) {
                      distance += 2.0; // Swarm Magnet: Treat planned breaches as almost air
                  } else {
                      BlockState s = level.getBlockState(to);
@@ -404,7 +404,7 @@ public class AStarPathfinder {
                  }
             }
             if (!isPassable(level, to.above(), false, maxHardness)) {
-                 if (MobPathManager.isPlannedBreach(to.above())) {
+                 if (MobPathManager.isPlannedBreach(level, to.above())) {
                      distance += 2.0; // Swarm Magnet: Treat planned breaches as almost air
                  } else {
                      BlockState s = level.getBlockState(to.above());
@@ -549,12 +549,8 @@ public class AStarPathfinder {
 
         BlockState below = level.getBlockState(pos.below());
 
-        // Need solid ground below OR be next to a wall (climbing)
-        if (below.blocksMotion() || below.liquid()) {
-            return true;
-        }
-
-        return isNextToWall(level, pos);
+        // Require solid ground below for standable nodes
+        return below.blocksMotion() || below.liquid();
     }
 
     /**

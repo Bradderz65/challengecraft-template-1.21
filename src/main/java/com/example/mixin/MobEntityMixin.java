@@ -117,6 +117,15 @@ public abstract class MobEntityMixin {
 
 		// Try A* pathfinding if enabled
 		boolean usingAStar = com.example.ai.MobPathManager.updatePathfinding(mob, target);
+		boolean pathFailed = com.example.ai.MobPathManager.isPathFailed(mob);
+		if (!usingAStar && pathFailed && com.example.ai.MobBuilderHandler.shouldBuild(mob, target.blockPosition(), true)) {
+			com.example.ai.MobBuilderHandler.startBuilding(mob, target.blockPosition());
+		}
+		if (com.example.ai.MobBuilderHandler.isBuilding(mob)) {
+			if (com.example.ai.MobBuilderHandler.tickBuilding(mob, target.blockPosition())) {
+				return;
+			}
+		}
 
 		// Gap Jumping Logic:
 		// If the pathfinder found a path with a gap (next node is > 1.5 blocks away
@@ -133,13 +142,15 @@ public abstract class MobEntityMixin {
 					double dx = nextNode.getX() + 0.5 - mob.getX();
 					double dz = nextNode.getZ() + 0.5 - mob.getZ();
 					double distSqrHorizontal = dx * dx + dz * dz;
+					var landingState = mob.level().getBlockState(nextNode.below());
+					boolean hasLanding = landingState.blocksMotion() || landingState.liquid();
 
 					// Standard move is ~1 block distance (sqr ~ 1).
 					// Diagonal is ~1.41 (sqr ~ 2).
 					// Jump (2 blocks) is ~2.0 (sqr ~ 4).
 					// If distance > 2.25 (1.5 blocks), it's a gap jump.
 					// Also ensure we are facing it roughly? Or just force velocity.
-					if (distSqrHorizontal > 2.25 && nextDeltaY <= 1) {
+					if (distSqrHorizontal > 2.25 && nextDeltaY == 1 && hasLanding) {
 						mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
 								nextNode.getZ() + 0.5);
 						// Jump if on ground (and maybe slightly before edge?)

@@ -2,11 +2,15 @@ package com.example.antitower;
 
 import com.example.ChallengeMod;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 
@@ -18,11 +22,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * destroys ALL of them after a delay.
  */
 public class AntiTowerHandler {
+    private record DimPos(ResourceKey<Level> dimension, BlockPos pos) {
+    }
+
     // Track blocks placed by each player
-    private static final Map<UUID, Set<BlockPos>> playerPlacedBlocks = new ConcurrentHashMap<>();
+    private static final Map<UUID, Set<DimPos>> playerPlacedBlocks = new ConcurrentHashMap<>();
+
+    // Track block owners for quick cleanup
+    private static final Map<DimPos, UUID> blockOwners = new ConcurrentHashMap<>();
 
     // Track when tower was first detected for each player
-    private static final Map<UUID, Long> towerDetectedTime = new ConcurrentHashMap<>();
+    private static final Map<UUID, Map<ResourceKey<Level>, Long>> towerDetectedTime = new ConcurrentHashMap<>();
 
     // Minimum stacked blocks to trigger
     private static final int MIN_TOWER_HEIGHT = 2;
@@ -53,11 +63,23 @@ public class AntiTowerHandler {
                 checkPlayerTower(player, currentTime, delayMs);
             }
         });
+
+        PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
+            if (world.isClientSide) {
+                return;
+            }
+            removeBlockOwnership(world, pos);
+        });
+
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            UUID playerId = handler.player.getUUID();
+            clearPlayer(playerId);
+        });
     }
 
     private static void checkPlayerTower(ServerPlayer player, long currentTime, int delayMs) {
         UUID playerId = player.getUUID();
-        Set<BlockPos> placedBlocks = playerPlacedBlocks.get(playerId);
+        Set<DimPos> placedBlocks = playerPlacedBlocks.get(playerId);
 
         if (placedBlocks == null || placedBlocks.isEmpty()) {
             towerDetectedTime.remove(playerId);
@@ -65,31 +87,41 @@ public class AntiTowerHandler {
         }
 
         // Count player-placed blocks directly below player
-        List<BlockPos> towerBlocks = getPlayerBlocksBelowPlayer(player, placedBlocks);
+        ResourceKey<Level> dimension = player.level().dimension();
+        List<BlockPos> towerBlocks = getPlayerBlocksBelowPlayer(player, placedBlocks, dimension);
 
         if (towerBlocks.size() >= MIN_TOWER_HEIGHT) {
             // Tower detected!
-            if (!towerDetectedTime.containsKey(playerId)) {
-                towerDetectedTime.put(playerId, currentTime);
+            Map<ResourceKey<Level>, Long> times = towerDetectedTime.computeIfAbsent(playerId,
+                    key -> new ConcurrentHashMap<>());
+            if (!times.containsKey(dimension)) {
+                times.put(dimension, currentTime);
                 ChallengeMod.LOGGER.info("[AntiTower] TOWER DETECTED! {} has {} blocks below. Destruction in {}s",
                         player.getName().getString(), towerBlocks.size(), ChallengeMod.getAntiTowerDelay());
             }
 
             // Check if delay has passed
-            long towerTime = currentTime - towerDetectedTime.get(playerId);
+            long towerTime = currentTime - times.get(dimension);
             if (towerTime >= delayMs) {
                 // DESTROY ALL TOWER BLOCKS!
-                destroyBlocks(player.serverLevel(), towerBlocks, placedBlocks);
-                towerDetectedTime.remove(playerId);
+                destroyBlocks(player.serverLevel(), towerBlocks, placedBlocks, dimension);
+                times.remove(dimension);
+                if (times.isEmpty()) {
+                    towerDetectedTime.remove(playerId);
+                }
 
                 ChallengeMod.LOGGER.info("[AntiTower] Destroyed {} blocks below {}",
                         towerBlocks.size(), player.getName().getString());
             }
         } else {
             // No tower, reset timer
-            if (towerDetectedTime.containsKey(playerId)) {
+            Map<ResourceKey<Level>, Long> times = towerDetectedTime.get(playerId);
+            if (times != null && times.containsKey(dimension)) {
                 ChallengeMod.LOGGER.info("[AntiTower] {} no longer on tower", player.getName().getString());
-                towerDetectedTime.remove(playerId);
+                times.remove(dimension);
+                if (times.isEmpty()) {
+                    towerDetectedTime.remove(playerId);
+                }
             }
         }
     }
@@ -98,7 +130,8 @@ public class AntiTowerHandler {
      * Get all player-placed blocks that are directly below the player in a vertical
      * stack.
      */
-    private static List<BlockPos> getPlayerBlocksBelowPlayer(ServerPlayer player, Set<BlockPos> placedBlocks) {
+    private static List<BlockPos> getPlayerBlocksBelowPlayer(ServerPlayer player, Set<DimPos> placedBlocks,
+            ResourceKey<Level> dimension) {
         List<BlockPos> tower = new ArrayList<>();
         BlockPos playerPos = player.blockPosition();
 
@@ -106,7 +139,7 @@ public class AntiTowerHandler {
         for (int y = playerPos.getY() - 1; y > player.level().getMinBuildHeight(); y--) {
             BlockPos checkPos = new BlockPos(playerPos.getX(), y, playerPos.getZ());
 
-            if (placedBlocks.contains(checkPos)) {
+            if (placedBlocks.contains(new DimPos(dimension, checkPos))) {
                 tower.add(checkPos);
             } else {
                 // Hit a non-player block, stop checking
@@ -120,10 +153,13 @@ public class AntiTowerHandler {
     /**
      * Destroy all specified blocks with effects.
      */
-    private static void destroyBlocks(ServerLevel level, List<BlockPos> blocks, Set<BlockPos> placedBlocks) {
+    private static void destroyBlocks(ServerLevel level, List<BlockPos> blocks, Set<DimPos> placedBlocks,
+            ResourceKey<Level> dimension) {
         for (BlockPos pos : blocks) {
             destroyBlockWithEffect(level, pos);
-            placedBlocks.remove(pos);
+            DimPos dimPos = new DimPos(dimension, pos);
+            placedBlocks.remove(dimPos);
+            blockOwners.remove(dimPos);
         }
     }
 
@@ -136,9 +172,11 @@ public class AntiTowerHandler {
         }
 
         UUID playerId = player.getUUID();
-        Set<BlockPos> placedBlocks = playerPlacedBlocks.computeIfAbsent(playerId,
+        Set<DimPos> placedBlocks = playerPlacedBlocks.computeIfAbsent(playerId,
                 k -> ConcurrentHashMap.newKeySet());
-        placedBlocks.add(pos.immutable());
+        DimPos dimPos = new DimPos(player.level().dimension(), pos.immutable());
+        placedBlocks.add(dimPos);
+        blockOwners.put(dimPos, playerId);
 
         ChallengeMod.LOGGER.info("[AntiTower] {} placed block at {}", player.getName().getString(), pos);
     }
@@ -175,8 +213,7 @@ public class AntiTowerHandler {
      * Reset tracking for a player.
      */
     public static void resetPlayer(UUID playerId) {
-        playerPlacedBlocks.remove(playerId);
-        towerDetectedTime.remove(playerId);
+        clearPlayer(playerId);
     }
 
     /**
@@ -184,6 +221,32 @@ public class AntiTowerHandler {
      */
     public static void clearAll() {
         playerPlacedBlocks.clear();
+        blockOwners.clear();
         towerDetectedTime.clear();
+    }
+
+    private static void clearPlayer(UUID playerId) {
+        Set<DimPos> placed = playerPlacedBlocks.remove(playerId);
+        if (placed != null) {
+            for (DimPos pos : placed) {
+                blockOwners.remove(pos);
+            }
+        }
+        towerDetectedTime.remove(playerId);
+    }
+
+    private static void removeBlockOwnership(Level level, BlockPos pos) {
+        DimPos dimPos = new DimPos(level.dimension(), pos.immutable());
+        UUID owner = blockOwners.remove(dimPos);
+        if (owner == null) {
+            return;
+        }
+        Set<DimPos> placed = playerPlacedBlocks.get(owner);
+        if (placed != null) {
+            placed.remove(dimPos);
+            if (placed.isEmpty()) {
+                playerPlacedBlocks.remove(owner);
+            }
+        }
     }
 }

@@ -1,6 +1,7 @@
 package com.example;
 
 import com.example.antitower.AntiTowerHandler;
+import com.example.config.ModConfig;
 import net.fabricmc.api.ModInitializer;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -144,6 +145,9 @@ public class ChallengeMod implements ModInitializer {
 
 		LOGGER.info("ChallengeMod initialized");
 
+		// Load config for dedicated server and singleplayer
+		ModConfig.load();
+
 		// Register anti-tower handler
 		AntiTowerHandler.register();
 
@@ -205,6 +209,8 @@ public class ChallengeMod implements ModInitializer {
 				if (pendingActivationTicks == 0) {
 					challengeActive = true;
 					challengeLocked = pendingLock;
+					ModConfig.setChallengeActive(true);
+					ModConfig.save();
 					LOGGER.info("Challenge enabled (locked={})", challengeLocked);
 				}
 			}
@@ -213,6 +219,8 @@ public class ChallengeMod implements ModInitializer {
 
 	private static int setTargetMode(CommandSourceStack source, TargetMode mode) {
 		targetMode = mode;
+		ModConfig.setTargetMode(mode);
+		ModConfig.save();
 		source.sendSuccess(() -> Component.literal("Targeting mode set to " + mode.name().toLowerCase()), false);
 		return 1;
 	}
@@ -244,6 +252,8 @@ public class ChallengeMod implements ModInitializer {
 		pendingLock = lock;
 		challengeActive = delayTicks == 0;
 		challengeLocked = delayTicks == 0 && lock;
+		ModConfig.setChallengeActive(challengeActive);
+		ModConfig.save();
 	}
 
 	private static void stopChallengeInternal() {
@@ -251,6 +261,8 @@ public class ChallengeMod implements ModInitializer {
 		pendingLock = false;
 		challengeActive = false;
 		challengeLocked = false;
+		ModConfig.setChallengeActive(false);
+		ModConfig.save();
 		AntiTowerHandler.clearAll();
 		com.example.ai.MobPathManager.clearAll();
 		com.example.antitower.MobBreakerHandler.clearAll();
@@ -258,6 +270,8 @@ public class ChallengeMod implements ModInitializer {
 
 	private static int setSpeedMultiplier(CommandSourceStack source, double multiplier) {
 		speedMultiplier = multiplier;
+		ModConfig.setSpeedMultiplier(multiplier);
+		ModConfig.save();
 		source.sendSuccess(() -> Component.literal("Challenge speed set to " + multiplier), false);
 		return 1;
 	}

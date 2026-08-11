@@ -2,6 +2,7 @@ package com.example.mixin;
 
 import com.example.ChallengeMod;
 import com.example.antitower.MobBreakerHandler;
+import com.example.ai.MobPathManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.monster.AbstractSkeleton;
@@ -36,6 +37,10 @@ public abstract class ProjectileMixin {
             if (arrow.getOwner() instanceof AbstractSkeleton) {
                 BlockPos pos = hitResult.getBlockPos();
                 BlockState state = projectile.level().getBlockState(pos);
+
+                if (MobPathManager.isMobPlacedBlock(projectile.level(), pos)) {
+                    return;
+                }
 
                 // Calculate damage
                 // Arrows should do small chip damage.

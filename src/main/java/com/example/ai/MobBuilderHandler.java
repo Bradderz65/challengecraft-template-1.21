@@ -3,6 +3,7 @@ package com.example.ai;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -68,6 +69,9 @@ public class MobBuilderHandler {
      */
     public static void startBuilding(Mob mob, BlockPos targetPos) {
         if (mob.level().isClientSide)
+            return;
+
+        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
             return;
 
         // If already building, don't restart unless explicitly cancelled
@@ -156,6 +160,11 @@ public class MobBuilderHandler {
     public static boolean tickBuilding(Mob mob, BlockPos targetPos) {
         if (mob.level().isClientSide)
             return false;
+
+        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING)) {
+            cancelBuilding(mob);
+            return false;
+        }
 
         UUID mobId = mob.getUUID();
         BuildingState state = buildingStates.get(mobId);
