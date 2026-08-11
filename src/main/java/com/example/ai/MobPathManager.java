@@ -124,15 +124,22 @@ public class MobPathManager {
         public BlockPos lastPos = null;
         public int stuckTicks = 0;
         public long lastCheckTime = 0;
+        public final boolean partial;
 
         public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy) {
+            this(path, targetPos, buildActions, strategy, false);
+        }
+
+        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy,
+                boolean partial) {
             this.path = path;
             this.strategy = strategy;
             this.timestamp = System.currentTimeMillis();
             this.currentNodeIndex = 0;
             this.targetPos = targetPos;
-            this.buildActions = buildActions != null ? buildActions : Collections.emptyMap();
+            this.buildActions = buildActions != null ? new HashMap<>(buildActions) : new HashMap<>();
             this.lastCheckTime = timestamp;
+            this.partial = partial;
         }
         
         public void checkStuck(Mob mob, Player target) {
@@ -142,7 +149,8 @@ public class MobPathManager {
                 if (stuckTicks > 20 && stuckTicks % 100 == 0) { // Log every 5s after being stuck for 1s
                      if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
                          BlockPos next = getNextNode();
-                         String buildInfo = (buildActions.containsKey(next) ? " (Needs Build at " + buildActions.get(next) + ")" : "");
+                         String buildInfo = (next != null && buildActions.containsKey(next)
+                                 ? " (Needs Build at " + buildActions.get(next) + ")" : "");
                          ChallengeMod.LOGGER.warn("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}", 
                              mob.getUUID().toString().substring(0, 4), currentPos, stuckTicks, next, buildInfo);
                      }
@@ -151,6 +159,23 @@ public class MobPathManager {
                 stuckTicks = 0;
                 lastPos = currentPos;
             }
+        }
+
+        public boolean isStuckLong() {
+            return stuckTicks >= 40; // 2 seconds without moving
+        }
+
+        /**
+         * Remaining path nodes from the current index (for debug render).
+         */
+        public List<BlockPos> remainingPath() {
+            if (currentNodeIndex <= 0) {
+                return path;
+            }
+            if (currentNodeIndex >= path.size()) {
+                return Collections.emptyList();
+            }
+            return path.subList(currentNodeIndex, path.size());
         }
 
         public boolean isExpired() {
@@ -228,14 +253,18 @@ public class MobPathManager {
         if (distance < 1.5) {
             pathCache.remove(mob.getUUID());
             pathFailures.remove(mob.getUUID());
+            clearClientPath(mob);
+            BuildPlanData.removeBuildPlan(mob.getUUID());
             return false;
         }
 
         // For very long ranges, don't use A*
         if (distance > MAX_ASTAR_DISTANCE
                 && horizontalDistSqr > (MAX_ASTAR_HORIZONTAL_DISTANCE * MAX_ASTAR_HORIZONTAL_DISTANCE)) {
-                pathCache.remove(mob.getUUID());
+            pathCache.remove(mob.getUUID());
             pathFailures.remove(mob.getUUID());
+            clearClientPath(mob);
+            BuildPlanData.removeBuildPlan(mob.getUUID());
             return false;
         }
 
@@ -247,7 +276,9 @@ public class MobPathManager {
         // Check if we need to recalculate the path
         boolean needsRecalculation = cached == null
                 || cached.isExpired()
-                || cached.isComplete();
+                || cached.isComplete()
+                || cached.isStuckLong()
+                || cached.partial; // partials should replan more eagerly once interval allows
         
         if (cached != null && !needsRecalculation) {
             // Target moved far from path end?
@@ -283,14 +314,17 @@ public class MobPathManager {
             }
         }
 
-        if (cached != null && needsRecalculation && currentTick - cached.lastRecalcTick < RECALCULATE_INTERVAL) {
+        // Allow immediate replan when stuck; otherwise respect recalc interval
+        boolean stuckReplan = cached != null && cached.isStuckLong();
+        if (cached != null && needsRecalculation && !stuckReplan
+                && currentTick - cached.lastRecalcTick < RECALCULATE_INTERVAL) {
             needsRecalculation = false;
         }
 
         if (needsRecalculation) {
-            // Throttling Check
-            if (pathCalcsPerTick < 1) {
-                if (cached == null || currentTick - cached.lastRecalcTick >= RECALCULATE_INTERVAL) {
+            // Throttling Check — allow a few calcs per tick so swarms recover
+            if (pathCalcsPerTick < 3) {
+                if (cached == null || stuckReplan || currentTick - cached.lastRecalcTick >= RECALCULATE_INTERVAL) {
                     pathCalcsPerTick++;
                     
                     AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, targetPos, false);
@@ -307,7 +341,7 @@ public class MobPathManager {
 
                     if (mobGriefing && !result.found) {
                         AStarPathfinder.PathResult softBreakResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, false, 1.0f);
-                        if (softBreakResult.found || (softBreakResult.isPartial && !result.isPartial)) {
+                        if (softBreakResult.found || (softBreakResult.isPartial && !result.found && isCloserPartial(softBreakResult, result, targetPos))) {
                             result = softBreakResult;
                             strategy = "SoftBreak";
                         }
@@ -322,8 +356,8 @@ public class MobPathManager {
                     if (mobGriefing && !result.found) {
                         AStarPathfinder.PathResult buildResult = AStarPathfinder.findPath(mob, mob.blockPosition(), targetPos, true, true);
                         boolean buildHasActions = buildResult.buildActions != null && !buildResult.buildActions.isEmpty();
-                        if (buildHasActions && (buildResult.found || (buildResult.isPartial && !result.isPartial))) {
-                            if (bestApproach != null && !bestApproach.path.isEmpty()) {
+                        if (buildHasActions && (buildResult.found || buildResult.isPartial)) {
+                            if (bestApproach != null && !bestApproach.path.isEmpty() && !buildResult.found) {
                                 BlockPos approachEnd = bestApproach.path.get(bestApproach.path.size() - 1);
                                 double approachDist = approachEnd.distToCenterSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5,
                                         targetPos.getZ() + 0.5);
@@ -347,56 +381,43 @@ public class MobPathManager {
 
                     if (mobGriefing && !result.found) {
                         AStarPathfinder.PathResult destructiveResult = AStarPathfinder.findPath(mob, targetPos, true);
-                        if (destructiveResult.found || (destructiveResult.isPartial && !result.isPartial)) {
+                        if (destructiveResult.found
+                                || (destructiveResult.isPartial && !result.found
+                                        && isCloserPartial(destructiveResult, result, targetPos))) {
                             result = destructiveResult;
                             strategy = "HardBreak";
                         }
                     }
 
-                    if (result.found && !result.path.isEmpty()) {
-                        boolean keepOldPath = (cached != null && cached.strategy.equals(strategy));
-                        if (keepOldPath) {
-                            cached.lastCheckTime = System.currentTimeMillis();
-                            cached.lastRecalcTick = currentTick;
-                            if ("Building".equals(strategy) && cached.buildLockUntilTick < currentTick) {
-                                cached.buildLockUntilTick = currentTick + BUILD_PATH_LOCK_TICKS;
-                            }
-                        } else {
-                            cached = new CachedPath(result.path, targetPos, result.buildActions, strategy);
-                            cached.lastRecalcTick = currentTick;
-                            if ("Building".equals(strategy)) {
-                                cached.buildLockUntilTick = currentTick + BUILD_PATH_LOCK_TICKS;
-                            }
-                            pathCache.put(mob.getUUID(), cached);
-                            
-                            // Broadcast breaches
-                            for (BlockPos node : result.path) {
-                                if (isSolid(mob.level(), node)) registerBreach(mob.level(), node);
-                                if (isSolid(mob.level(), node.above())) registerBreach(mob.level(), node.above());
-                            }
-
-                            syncPathToClients(mob, result.path);
-                            if (!result.buildActions.isEmpty()) {
-                                BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
-                                if (ChallengeMod.isAStarDebugEnabled()) {
-                                    logBuildPlan(mob, cached, "selected");
-                                }
-                            } else {
-                                BuildPlanData.removeBuildPlan(mob.getUUID());
-                                if (ChallengeMod.isAStarDebugEnabled() && "Building".equals(strategy)) {
-                                    ChallengeMod.LOGGER.info("[BuildPlan] mob={} cancelled reason=no_build_actions",
-                                            mob.getUUID().toString().substring(0, 4));
-                                }
-                            }
-                        }
-                    } else if (result.isPartial && !result.path.isEmpty()) {
-                        cached = new CachedPath(result.path, targetPos, result.buildActions, strategy);
+                    // Prefer a full path; otherwise accept a usable partial
+                    boolean usable = (result.found || result.isPartial) && !result.path.isEmpty();
+                    if (usable) {
+                        cached = new CachedPath(result.path, targetPos, result.buildActions, strategy, result.isPartial);
                         cached.lastRecalcTick = currentTick;
                         if ("Building".equals(strategy)) {
                             cached.buildLockUntilTick = currentTick + BUILD_PATH_LOCK_TICKS;
                         }
                         pathCache.put(mob.getUUID(), cached);
+
+                        // Broadcast breaches for break nodes
+                        for (BlockPos node : result.path) {
+                            if (isSolid(mob.level(), node)) registerBreach(mob.level(), node);
+                            if (isSolid(mob.level(), node.above())) registerBreach(mob.level(), node.above());
+                        }
+
                         syncPathToClients(mob, result.path);
+                        if (!result.buildActions.isEmpty()) {
+                            BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
+                            if (ChallengeMod.isAStarDebugEnabled() && result.found) {
+                                logBuildPlan(mob, cached, "selected");
+                            }
+                        } else {
+                            BuildPlanData.removeBuildPlan(mob.getUUID());
+                            if (ChallengeMod.isAStarDebugEnabled() && "Building".equals(strategy) && result.found) {
+                                ChallengeMod.LOGGER.info("[BuildPlan] mob={} cancelled reason=no_build_actions",
+                                        mob.getUUID().toString().substring(0, 4));
+                            }
+                        }
                     } else {
                         pathCache.remove(mob.getUUID());
                         clearClientPath(mob);
@@ -420,9 +441,16 @@ public class MobPathManager {
             pathFailures.remove(mob.getUUID());
             cached.checkStuck(mob, target);
             BlockPos nextNode = cached.getNextNode();
-            
-            if (mob.tickCount % 20 == 0 && !cached.buildActions.isEmpty()) {
-                 BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
+
+            // Keep debug overlays alive and trimmed to remaining path while following
+            if (mob.tickCount % 10 == 0) {
+                List<BlockPos> remaining = cached.remainingPath();
+                if (!remaining.isEmpty()) {
+                    syncPathToClients(mob, remaining);
+                }
+                if (!cached.buildActions.isEmpty()) {
+                    BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
+                }
             }
             
             if (nextNode != null) {
@@ -505,7 +533,8 @@ public class MobPathManager {
                     }
 
                     if (isBlocked) {
-                        if (!mobGriefing) {
+                        // Standard paths should never need to break — world changed; replan next tick
+                        if (!mobGriefing || "Standard".equals(cached.strategy)) {
                             pathCache.remove(mob.getUUID());
                             clearClientPath(mob);
                             BuildPlanData.removeBuildPlan(mob.getUUID());
@@ -553,11 +582,22 @@ public class MobPathManager {
 
     private static boolean isCloserPartial(AStarPathfinder.PathResult candidate, AStarPathfinder.PathResult current,
             BlockPos targetPos) {
-        if (candidate == null || candidate.path.isEmpty()) {
+        if (candidate == null || candidate.path == null || candidate.path.isEmpty()) {
             return false;
         }
-        if (current == null || current.path.isEmpty()) {
+        // A full path always beats a partial / empty result
+        if (candidate.found && (current == null || !current.found)) {
             return true;
+        }
+        if (current == null || current.path == null || current.path.isEmpty()) {
+            return true;
+        }
+        // Prefer full over partial when both have paths
+        if (candidate.found && current.isPartial) {
+            return true;
+        }
+        if (candidate.isPartial && current.found) {
+            return false;
         }
         BlockPos candidateEnd = candidate.path.get(candidate.path.size() - 1);
         BlockPos currentEnd = current.path.get(current.path.size() - 1);

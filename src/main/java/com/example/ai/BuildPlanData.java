@@ -18,15 +18,28 @@ public class BuildPlanData {
     // Timestamp for each plan (for cleanup)
     private static final Map<UUID, Long> planTimestamps = new ConcurrentHashMap<>();
 
-    // Plan expiry time in milliseconds
-    private static final long PLAN_EXPIRY_MS = 5000;
+    // Plan expiry — aligned with path debug lifetime
+    private static final long PLAN_EXPIRY_MS = 20000;
 
     /**
      * Set the build plan for a mob
      */
     public static void setBuildPlan(UUID mobId, List<BlockPos> plan) {
+        if (plan == null || plan.isEmpty()) {
+            removeBuildPlan(mobId);
+            return;
+        }
         mobBuildPlans.put(mobId, new ArrayList<>(plan));
         planTimestamps.put(mobId, System.currentTimeMillis());
+    }
+
+    /**
+     * Refresh expiry without changing the stored plan.
+     */
+    public static void touchBuildPlan(UUID mobId) {
+        if (mobBuildPlans.containsKey(mobId)) {
+            planTimestamps.put(mobId, System.currentTimeMillis());
+        }
     }
 
     /**

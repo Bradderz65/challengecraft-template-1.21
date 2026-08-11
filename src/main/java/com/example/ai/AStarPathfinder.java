@@ -38,7 +38,7 @@ public class AStarPathfinder {
     /**
      * Node class for A* algorithm
      */
-    public static class PathNode implements Comparable<PathNode> {
+    public static class PathNode {
         public final BlockPos pos;
         public double gCost; // Cost from start
         public double hCost; // Heuristic cost to goal
@@ -57,15 +57,6 @@ public class AStarPathfinder {
         }
 
         @Override
-        public int compareTo(PathNode other) {
-            int compare = Double.compare(this.fCost(), other.fCost());
-            if (compare == 0) {
-                compare = Double.compare(this.hCost, other.hCost);
-            }
-            return compare;
-        }
-
-        @Override
         public boolean equals(Object obj) {
             if (this == obj)
                 return true;
@@ -77,6 +68,37 @@ public class AStarPathfinder {
         @Override
         public int hashCode() {
             return pos.hashCode();
+        }
+    }
+
+    /**
+     * Open-set entry that freezes costs at insertion time so PriorityQueue stays
+     * valid when node g/h are later improved (lazy decrease-key).
+     */
+    private static final class OpenEntry implements Comparable<OpenEntry> {
+        final double fCost;
+        final double gCost;
+        final double hCost;
+        final PathNode node;
+
+        OpenEntry(PathNode node) {
+            this.node = node;
+            this.gCost = node.gCost;
+            this.hCost = node.hCost;
+            this.fCost = node.gCost + node.hCost;
+        }
+
+        boolean isStale() {
+            return gCost != node.gCost;
+        }
+
+        @Override
+        public int compareTo(OpenEntry other) {
+            int compare = Double.compare(this.fCost, other.fCost);
+            if (compare == 0) {
+                compare = Double.compare(this.hCost, other.hCost);
+            }
+            return compare;
         }
     }
 
@@ -126,19 +148,19 @@ public class AStarPathfinder {
         Level level = mob.level();
 
         // Quick checks
-        if (start.equals(target)) {
-            return new PathResult(Collections.singletonList(target), true, false, 0, null);
+        if (start.equals(target) || isGoal(start, target)) {
+            return new PathResult(Collections.singletonList(start.equals(target) ? target : start), true, false, 0, null);
         }
 
-        // A* algorithm
-        PriorityQueue<PathNode> openSet = new PriorityQueue<>();
+        // A* algorithm with lazy open-set (no O(n) remove on decrease-key)
+        PriorityQueue<OpenEntry> openSet = new PriorityQueue<>();
         Map<BlockPos, PathNode> allNodes = new HashMap<>();
         Set<BlockPos> closedSet = new HashSet<>();
 
         PathNode startNode = new PathNode(start);
         startNode.gCost = 0;
         startNode.hCost = heuristic(start, target);
-        openSet.add(startNode);
+        openSet.add(new OpenEntry(startNode));
         allNodes.put(start, startNode);
 
         PathNode closestNode = startNode;
@@ -147,54 +169,68 @@ public class AStarPathfinder {
         int nodesExplored = 0;
 
         while (!openSet.isEmpty() && nodesExplored < MAX_NODES) {
-            PathNode current = openSet.poll();
-            nodesExplored++;
+            OpenEntry entry = openSet.poll();
+            if (entry == null) {
+                break;
+            }
+            // Skip superseded entries left in the heap after a better path was found
+            if (entry.isStale()) {
+                continue;
+            }
 
-            // Track closest node
+            PathNode current = entry.node;
+            if (closedSet.contains(current.pos)) {
+                continue;
+            }
+
+            nodesExplored++;
+            closedSet.add(current.pos);
+
+            // Track closest node for partial paths
             if (current.hCost < minHCost) {
                 minHCost = current.hCost;
                 closestNode = current;
             }
 
-            // Check if we reached the target (within 2 blocks)
-            if (current.pos.closerThan(target, 2.0)) {
-                return reconstructPathResult(current, nodesExplored);
+            // Goal: adjacent (incl. diagonal / 1 up-down), not a loose 2-block radius
+            if (isGoal(current.pos, target)) {
+                return reconstructPathResult(current, nodesExplored, true, false);
             }
 
-            closedSet.add(current.pos);
-
             // Explore neighbors
-            // Standard moves (1 block, diagonals, etc provided by DIRECTIONS)
             for (int[] dir : DIRECTIONS) {
                 BlockPos neighborPos = current.pos.offset(dir[0], dir[1], dir[2]);
 
                 // 1. Try Standard Move (Walk / Climb)
                 if (isValidMove(level, current.pos, neighborPos, mob, allowBreaking, maxHardness)) {
-                    processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob, false,
+                    processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, false,
                             allowBreaking, null, maxHardness);
                 }
-                // 2. Try Drop Move (Walk off, fall to ground)
+                // 2. Try Drop Move (Walk off, fall to standable landing)
                 else {
-                    // If neighbor is not valid move, maybe it's a hole we can drop down?
-                    // Must be horizontal move (dy=0 or maybe -1) into Air
                     int dy = neighborPos.getY() - current.pos.getY();
-                    if (dy <= 0) {
+                    // Only from level / slight-down steps into air column
+                    if (dy <= 0 && dy >= -1) {
                         if (isPassable(level, neighborPos, allowBreaking, maxHardness)
-                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)) {
-                            // Scan down for ground
+                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)
+                                && !isDanger(level, neighborPos)) {
                             for (int i = 1; i <= 4; i++) {
                                 BlockPos landing = neighborPos.below(i);
+                                if (!level.isInWorldBounds(landing) || !level.hasChunkAt(landing)) {
+                                    break;
+                                }
+                                if (isDanger(level, landing) || isDanger(level, landing.below())) {
+                                    break;
+                                }
                                 if (canStandAt(level, landing, allowBreaking, maxHardness)) {
-                                    // Found safe landing!
-                                    // Connect Current -> Landing.
-                                    // Add cost based on distance
-                                    processNeighbor(current, landing, level, openSet, closedSet, allNodes, target, mob,
+                                    processNeighbor(current, landing, level, openSet, closedSet, allNodes, target,
                                             false, allowBreaking, null, maxHardness);
-                                    break; // Only register the first solid landing
+                                    break;
                                 }
                                 BlockState s = level.getBlockState(landing);
-                                if (s.blocksMotion() && (!allowBreaking || s.getDestroySpeed(level, landing) < 0 || s.getDestroySpeed(level, landing) > maxHardness)) {
-                                    break; // Hit obstruction that we can't stand on (lava? slab?), stop.
+                                float hardness = s.getDestroySpeed(level, landing);
+                                if (s.blocksMotion() && (!allowBreaking || hardness < 0 || hardness > maxHardness)) {
+                                    break;
                                 }
                             }
                         }
@@ -203,37 +239,35 @@ public class AStarPathfinder {
 
                 // 3. Try Building Moves (Bridge)
                 if (allowBuilding) {
-                    // Bridging: Horizontal move, neighbor is air, neighbor.below() is air
-                    // We place a block at neighbor.below()
                     int dy = neighborPos.getY() - current.pos.getY();
-                    if (dy == 0) { // Horizontal
+                    if (dy == 0) {
                         if (isPassable(level, neighborPos, allowBreaking, maxHardness)
-                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)) {
+                                && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)
+                                && !isDanger(level, neighborPos)) {
                             BlockPos bridgeBlock = neighborPos.below();
                             if (level.getBlockState(bridgeBlock).isAir()
                                     || level.getBlockState(bridgeBlock).liquid()) {
-                                // We can bridge here
-                                processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, mob,
+                                processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target,
                                         false, allowBreaking, bridgeBlock, maxHardness);
                             }
                         }
                     }
                 }
             }
-            
+
             // 4. Try Building Moves (Pillar Up)
             if (allowBuilding) {
                 BlockPos up = current.pos.above();
-                if (isPassable(level, up, allowBreaking, maxHardness) && isPassable(level, up.above(), allowBreaking, maxHardness)) {
-                    // We can pillar up by placing a block at current.pos (jumping up)
-                    // We arrive at 'up'. The block to place is 'current.pos'.
-                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, mob, true, allowBreaking, current.pos, maxHardness);
+                if (isPassable(level, up, allowBreaking, maxHardness)
+                        && isPassable(level, up.above(), allowBreaking, maxHardness)
+                        && !isDanger(level, up)) {
+                    // Arrive at 'up' after placing a block at current.pos
+                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, true, allowBreaking,
+                            current.pos, maxHardness);
                 }
             }
 
-            // Jumping moves (2 blocks horizontal, over gaps)
-            // Only cardinal directions for jumps to keep it simple
-            // If building is allowed, DISABLE 2-block jumps to force bridging (safer)
+            // Jumping moves (2 blocks horizontal). Disabled when building so bridges are preferred.
             if (!allowBuilding) {
                 int[][] jumps = { { 2, 0, 0 }, { -2, 0, 0 }, { 0, 0, 2 }, { 0, 0, -2 } };
                 for (int[] jump : jumps) {
@@ -241,22 +275,33 @@ public class AStarPathfinder {
                     BlockPos midPoint = current.pos.offset(jump[0] / 2, jump[1] / 2, jump[2] / 2);
 
                     if (isValidJump(level, current.pos, midPoint, jumpTarget, mob, allowBreaking, maxHardness)) {
-                        processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, mob, true,
+                        processNeighbor(current, jumpTarget, level, openSet, closedSet, allNodes, target, true,
                                 allowBreaking, null, maxHardness);
                     }
                 }
             }
         }
 
-        // Check if we found a partial path
-        if (closestNode != startNode && !closestNode.pos.equals(start)) {
-            return reconstructPathResult(closestNode, nodesExplored);
+        // Budget exhausted or open set empty: return best partial (not a full success)
+        if (closestNode != startNode && !closestNode.pos.equals(start) && closestNode.parent != null) {
+            return reconstructPathResult(closestNode, nodesExplored, false, true);
         }
 
         return PathResult.notFound(nodesExplored);
     }
-    
-    private static PathResult reconstructPathResult(PathNode goal, int nodesExplored) {
+
+    /**
+     * True when standing on / adjacent to the target (Chebyshev distance ≤ 1).
+     */
+    private static boolean isGoal(BlockPos current, BlockPos target) {
+        int dx = Math.abs(current.getX() - target.getX());
+        int dy = Math.abs(current.getY() - target.getY());
+        int dz = Math.abs(current.getZ() - target.getZ());
+        return Math.max(Math.max(dx, dy), dz) <= 1;
+    }
+
+    private static PathResult reconstructPathResult(PathNode goal, int nodesExplored, boolean found,
+            boolean isPartial) {
         List<BlockPos> path = new ArrayList<>();
         Map<BlockPos, BlockPos> buildActions = new HashMap<>();
         PathNode current = goal;
@@ -270,20 +315,17 @@ public class AStarPathfinder {
         }
 
         Collections.reverse(path);
-        return new PathResult(path, true, false, nodesExplored, buildActions);
+        return new PathResult(path, found, isPartial, nodesExplored, buildActions);
     }
 
     private static void processNeighbor(PathNode current, BlockPos neighborPos, Level level,
-            PriorityQueue<PathNode> openSet,
-            Set<BlockPos> closedSet, Map<BlockPos, PathNode> allNodes, BlockPos target, Mob mob, boolean isJump,
+            PriorityQueue<OpenEntry> openSet,
+            Set<BlockPos> closedSet, Map<BlockPos, PathNode> allNodes, BlockPos target, boolean isJump,
             boolean allowBreaking, BlockPos buildBlock, float maxHardness) {
-        if (closedSet.contains(neighborPos)) {
-            return;
-        }
-
         // Check if this movement is valid (Standard or Jump already validated)
         // If building, we skip isValidMove because we are creating the valid condition
-        if (buildBlock == null && !isJump && !isValidMove(level, current.pos, neighborPos, mob, allowBreaking, maxHardness)) {
+        if (buildBlock == null && !isJump
+                && !isValidMove(level, current.pos, neighborPos, null, allowBreaking, maxHardness)) {
             return;
         }
 
@@ -292,8 +334,7 @@ public class AStarPathfinder {
             moveCost += 0.5; // Jump penalty
 
         if (buildBlock != null) {
-            moveCost += 10.0; // Building penalty (make it expensive so they prefer walking)
-            // Pillar penalty
+            moveCost += 10.0; // Building penalty (prefer walking)
             if (neighborPos.getY() > current.pos.getY()) {
                 moveCost += 5.0; // Extra cost for pillaring up
             }
@@ -303,15 +344,16 @@ public class AStarPathfinder {
 
         PathNode neighborNode = allNodes.computeIfAbsent(neighborPos, PathNode::new);
 
+        // Allow reopening closed nodes when a cheaper path is found (non-uniform break costs)
         if (tentativeG < neighborNode.gCost) {
             neighborNode.parent = current;
             neighborNode.gCost = tentativeG;
             neighborNode.hCost = heuristic(neighborPos, target);
             neighborNode.buildPos = buildBlock;
 
-            // Remove and re-add to update priority
-            openSet.remove(neighborNode);
-            openSet.add(neighborNode);
+            closedSet.remove(neighborPos);
+            // Lazy decrease-key: leave stale heap entries; they are skipped when polled
+            openSet.add(new OpenEntry(neighborNode));
         }
     }
 
@@ -341,16 +383,14 @@ public class AStarPathfinder {
     }
 
     /**
-     * Heuristic function (3D Euclidean distance with vertical penalty)
+     * Heuristic function (3D Euclidean distance with light vertical bias).
+     * Weight kept close to 1 so paths stay near-optimal while still slightly greedy.
      */
     private static double heuristic(BlockPos from, BlockPos to) {
         double dx = from.getX() - to.getX();
         double dy = from.getY() - to.getY();
         double dz = from.getZ() - to.getZ();
-        // Add extra cost for vertical movement.
-        // Weighted A*: Multiply heuristic by 1.5 to prioritize speed/greediness over
-        // perfect efficiency.
-        return (Math.sqrt(dx * dx + dy * dy + dz * dz) + Math.abs(dy) * 0.5) * 1.5;
+        return (Math.sqrt(dx * dx + dy * dy + dz * dz) + Math.abs(dy) * 0.25) * 1.1;
     }
 
     /**
@@ -425,110 +465,78 @@ public class AStarPathfinder {
      */
     @SuppressWarnings("deprecation")
     private static boolean isValidMove(Level level, BlockPos from, BlockPos to, Mob mob, boolean allowBreaking, float maxHardness) {
-        // Check if the target position is within the world
-        if (!level.isInWorldBounds(to)) {
+        if (!level.isInWorldBounds(to) || !level.hasChunkAt(to)) {
             return false;
         }
 
-        // Check chunk loading
-        if (!level.hasChunkAt(to)) {
+        // Hard-block dangerous destinations
+        if (isDanger(level, to) || isDanger(level, to.below())) {
             return false;
         }
 
-        // DANGER CHECK: Do not allow moving into dangerous blocks
-        BlockState toState = level.getBlockState(to);
-        if (toState.is(Blocks.LAVA) || toState.is(Blocks.FIRE) || toState.is(Blocks.MAGMA_BLOCK)) {
-            return false;
-        }
-        BlockState belowState = level.getBlockState(to.below());
-        if (belowState.is(Blocks.LAVA) || belowState.is(Blocks.FIRE) || belowState.is(Blocks.MAGMA_BLOCK)) {
-            return false;
-        }
-
-        // Check if the mob can stand at the target position
-        if (!canStandAt(level, to, allowBreaking, maxHardness)) {
-            return false;
-        }
-
-        // Check vertical movement validity
         int dy = to.getY() - from.getY();
         int dx = to.getX() - from.getX();
         int dz = to.getZ() - from.getZ();
 
-        if (dy < -5) {
-            // Don't pathfind through huge drops (fall damage > 5 blocks)
+        if (dy < -4 || dy > 1) {
+            // Drops >4 handled only via dedicated landing edges; can't jump >1 normally
             return false;
         }
 
-        // Fix for "Floating Paths" & Dropping Logic:
+        // Feet + head must be enterable at destination
+        if (!isPassable(level, to, allowBreaking, maxHardness)
+                || !isPassable(level, to.above(), allowBreaking, maxHardness)) {
+            return false;
+        }
+
+        // Also need room at the origin head (prevents pathing out of 1-high crawl spaces wrong)
+        if (!hasHeadroom(level, from, allowBreaking, maxHardness)) {
+            return false;
+        }
+
         BlockState toBelow = level.getBlockState(to.below());
-        boolean isMarkedSolid = toBelow.blocksMotion() || toBelow.liquid();
+        boolean hasFloor = toBelow.blocksMotion() || toBelow.liquid();
 
-        if (!isMarkedSolid) {
-            // Target has no floor.
-
-            // Case 1: Climbing UP
+        if (hasFloor) {
+            // Normal standable node — OK
+        } else {
+            // No floor at destination: only allow pure wall climb up (spider-like)
             boolean isVerticalClimb = (dx == 0 && dz == 0 && dy == 1);
-            if (isVerticalClimb) {
-                // Must have wall support
-                if (!isNextToWall(level, to))
-                    return false;
+            if (isVerticalClimb && isNextToWall(level, to)) {
+                // Wall-climb step
             } else {
-                // Case 2: Dropping / Jumping off ledge
-                // We need to find the ground below 'to'
-                int dropDist = 0;
-                boolean foundGround = false;
-                for (int i = 1; i <= 5; i++) {
-                    BlockPos belowPos = to.below(i);
-                    BlockState s = level.getBlockState(belowPos);
-                    if (s.blocksMotion() || s.liquid()) {
-                        dropDist = i;
-                        foundGround = true;
-                        break;
-                    }
-                }
-
-                if (!foundGround || dropDist > 4) { // If no ground or drop is too far
-                    return false;
-                }
+                // Mid-air / drop cells are not stand nodes; drop landings are added separately
+                return false;
             }
         }
 
-        if (dy > 1) {
-            // Can't jump more than 1 block normally
-            return false;
-        }
-
-        // Check if there's enough headroom at both positions
-        if (!hasHeadroom(level, from, allowBreaking, maxHardness) || !hasHeadroom(level, to, allowBreaking, maxHardness)) {
-            return false;
-        }
-
-        // For horizontal moves, check for wall collision
-        if (dy == 0) {
-            // Diagonal moves need corner checks
-            if (Math.abs(dx) + Math.abs(dz) > 1) {
-                // Check both intermediate positions
-                BlockPos check1 = from.offset(dx, 0, 0);
-                BlockPos check2 = from.offset(0, 0, dz);
-                if (!isPassable(level, check1, allowBreaking, maxHardness) || !isPassable(level, check2, allowBreaking, maxHardness)) {
-                    return false;
-                }
-                
-                // CRITICAL: Corner Cutting Safety
-                // If either corner is dangerous (Lava/Fire), we CANNOT move diagonally.
-                // Even if "passable" (liquid), it's deadly to clip it.
-                if (isDanger(level, check1) || isDanger(level, check2)) {
+        // Diagonal corner cut (horizontal and diagonal-up/down)
+        if (Math.abs(dx) == 1 && Math.abs(dz) == 1) {
+            BlockPos check1 = from.offset(dx, 0, 0);
+            BlockPos check2 = from.offset(0, 0, dz);
+            // For vertical diagonals, also require the stepped intermediate cells passable at dy
+            BlockPos check1Y = from.offset(dx, dy, 0);
+            BlockPos check2Y = from.offset(0, dy, dz);
+            if (!isPassable(level, check1, allowBreaking, maxHardness)
+                    || !isPassable(level, check2, allowBreaking, maxHardness)) {
+                return false;
+            }
+            if (dy != 0) {
+                if (!isPassable(level, check1Y, allowBreaking, maxHardness)
+                        || !isPassable(level, check2Y, allowBreaking, maxHardness)) {
                     return false;
                 }
             }
+            if (isDanger(level, check1) || isDanger(level, check2)
+                    || isDanger(level, check1Y) || isDanger(level, check2Y)) {
+                return false;
+            }
         }
 
-        // For jumping up, check if there's a block to jump from or we are climbing
+        // Jumping up one block: must be grounded or already on a wall
         if (dy == 1) {
             BlockState below = level.getBlockState(from.below());
-            // If strictly vertical OR jumping, allow if grounded OR climbing
-            if (!below.blocksMotion() && !isNextToWall(level, from)) {
+            if (!below.blocksMotion() && !below.liquid() && !isNextToWall(level, from)) {
                 return false;
             }
         }

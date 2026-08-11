@@ -18,15 +18,28 @@ public class PathDebugData {
     // Timestamp for each path (for cleanup)
     private static final Map<UUID, Long> pathTimestamps = new ConcurrentHashMap<>();
 
-    // Path expiry time in milliseconds
-    private static final long PATH_EXPIRY_MS = 5000;
+    // Path expiry — long enough to cover cache lifetime; still cleaned when mob clears
+    private static final long PATH_EXPIRY_MS = 20000;
 
     /**
      * Set the path for a mob
      */
     public static void setMobPath(UUID mobId, List<BlockPos> path) {
+        if (path == null || path.isEmpty()) {
+            removeMobPath(mobId);
+            return;
+        }
         mobPaths.put(mobId, new ArrayList<>(path));
         pathTimestamps.put(mobId, System.currentTimeMillis());
+    }
+
+    /**
+     * Refresh expiry without changing the stored path.
+     */
+    public static void touchMobPath(UUID mobId) {
+        if (mobPaths.containsKey(mobId)) {
+            pathTimestamps.put(mobId, System.currentTimeMillis());
+        }
     }
 
     /**
