@@ -38,3 +38,6 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# Local Baritone checkout kept only for reference — never commit
+bariton use only for comparison/

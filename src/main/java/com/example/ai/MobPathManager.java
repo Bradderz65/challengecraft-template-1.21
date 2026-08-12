@@ -30,7 +30,6 @@ public class MobPathManager {
 
     // How often to recalculate paths (in ticks)
     private static final int RECALCULATE_INTERVAL = 100; // 5 seconds
-    private static final int STUCK_REPLAN_TICKS = 60; // 3s immobile before replan
     private static final int SOFT_PATH_LOCK_TICKS = 160; // commit to soft door path ~8s
 
     // Build-path stickiness window (ticks)
@@ -58,9 +57,6 @@ public class MobPathManager {
 
     /** Hard cap on all A* plans per server tick. Cached paths continue moving meanwhile. */
     private static final int MAX_PATH_CALCS_PER_TICK = 1;
-    /** Never increase same-tick work when a route opens; prioritize through generations instead. */
-    private static final int FREE_ROUTE_BOOST_CALCS = 1;
-    private static final int FREE_ROUTE_BOOST_TICKS = 30; // 1.5s
     private static final double TPS_CUTOFF = 18.0;
 
     /** How far a mob may be from the free corridor and still be forced onto it. */
@@ -92,7 +88,6 @@ public class MobPathManager {
      * every other mob adopts it (snap to nearest node) — no per-mob A* required.
      */
     private static volatile SharedFreeRoute sharedFreeRoute = null;
-    private static volatile long freeRouteBoostUntilTick = 0;
 
     private static final class SharedFreeRoute {
         final ResourceKey<Level> dimension;
@@ -182,7 +177,7 @@ public class MobPathManager {
 
         // Only drop shared free path if this cell was on it (corridor changed)
         SharedFreeRoute free = sharedFreeRoute;
-        if (free != null && free.dimension == level.dimension()) {
+        if (free != null && free.dimension.equals(level.dimension())) {
             boolean hits = false;
             for (BlockPos n : free.path) {
                 if (n.equals(imm) || n.above().equals(imm) || n.below().equals(imm)) {
@@ -200,7 +195,6 @@ public class MobPathManager {
         if (first && now - lastOpenHoleBumpMs >= 2_000) {
             lastOpenHoleBumpMs = now;
             bumpSwarmGeneration();
-            freeRouteBoostUntilTick = Math.max(freeRouteBoostUntilTick, level.getGameTime() + FREE_ROUTE_BOOST_TICKS);
             if (ChallengeMod.isAStarDebugEnabled()) {
                 ChallengeMod.LOGGER.debug("[OpenHole] {} near player — pack funnel", imm);
             }
@@ -239,7 +233,7 @@ public class MobPathManager {
         }
         SharedFreeRoute prev = sharedFreeRoute;
         // Keep a good shared route; refresh player anchor if they moved a little
-        if (prev != null && prev.isFresh() && prev.dimension == level.dimension()
+        if (prev != null && prev.isFresh() && prev.dimension.equals(level.dimension())
                 && prev.playerPos.closerThan(playerPos, 6.0)
                 && isValidFreeRoute(level, prev.path, playerPos)
                 && pathsShareEndpoint(prev.path, path)) {
@@ -248,10 +242,9 @@ public class MobPathManager {
             }
             return;
         }
-        boolean isNew = prev == null || !prev.isFresh() || prev.dimension != level.dimension()
+        boolean isNew = prev == null || !prev.isFresh() || !prev.dimension.equals(level.dimension())
                 || !pathsShareEndpoint(prev.path, path);
         sharedFreeRoute = new SharedFreeRoute(level.dimension(), path, playerPos, breachGeneration);
-        freeRouteBoostUntilTick = Math.max(freeRouteBoostUntilTick, level.getGameTime() + FREE_ROUTE_BOOST_TICKS);
         for (BlockPos n : path) {
             if (!isSolid(level, n)) {
                 DimPos k = new DimPos(level.dimension(), n.immutable());
@@ -319,7 +312,14 @@ public class MobPathManager {
         if (!isValidFreeRoute(level, free.path, playerPos)) {
             return false;
         }
-        return isSharedRouteStillOpen(level, free);
+        if (!isSharedRouteStillOpen(level, free)) {
+            // Corridor sealed — drop it so the pack replans
+            if (sharedFreeRoute == free) {
+                sharedFreeRoute = null;
+            }
+            return false;
+        }
+        return true;
     }
 
     public static boolean isOpenHole(Level level, BlockPos pos) {
@@ -455,12 +455,9 @@ public class MobPathManager {
         boolean buildingActive = cached != null && "Building".equals(cached.strategy)
                 && !cached.isExpired(currentTick) && !cached.isComplete();
 
-        int maxCalcs = currentTick < freeRouteBoostUntilTick
-                ? Math.min(FREE_ROUTE_BOOST_CALCS, MAX_PATH_CALCS_PER_TICK)
-                : MAX_PATH_CALCS_PER_TICK;
         // Low TPS / slot limit: still FOLLOW existing paths (and dig roof), just don't replan
         boolean allowNewPathCalc = ChallengeMod.getCurrentTps() >= TPS_CUTOFF
-                && pathCalcsPerTick < maxCalcs;
+                && pathCalcsPerTick < MAX_PATH_CALCS_PER_TICK;
 
         // Swarm / free-route generation → unlock so the pack funnels through open paths
         long seenGen = mobBreachGen.getOrDefault(mob.getUUID(), -1L);
@@ -474,7 +471,7 @@ public class MobPathManager {
         boolean freeAvailable = isFreeRouteUsable(mob.level(), free, targetPos);
         if (!freeAvailable && free != null && free.isFresh()) {
             // Drop invalid exterior freezes so dig / SoftBreak can run again
-            if (free.dimension == mob.level().dimension()
+            if (free.dimension.equals(mob.level().dimension())
                     && !isValidFreeRoute(mob.level(), free.path, targetPos)) {
                 sharedFreeRoute = null;
                 free = null;
@@ -499,7 +496,7 @@ public class MobPathManager {
                     cached = adopted;
                     pathCache.put(mob.getUUID(), cached);
                     BuildPlanData.removeBuildPlan(mob.getUUID());
-                    syncPathToClients(mob, cached.remainingPath());
+                    publishDebugPath(mob, cached.remainingPath());
                     onFreeCorridor = true;
                     swarmRepath = false;
                     if (ChallengeMod.isAStarDebugEnabled() && currentTick % 40 == 0) {
@@ -581,7 +578,7 @@ public class MobPathManager {
         }
 
         if (needsRecalculation && allowNewPathCalc) {
-            if (pathCalcsPerTick < maxCalcs) {
+            if (pathCalcsPerTick < MAX_PATH_CALCS_PER_TICK) {
                 if (cached == null || stuckReplan || swarmRepath || freeAvailable
                         || currentTick - cached.lastRecalcTick >= replanInterval) {
                     pathCalcsPerTick++;
@@ -683,7 +680,7 @@ public class MobPathManager {
                             }
                         }
 
-                        syncPathToClients(mob, result.path);
+                        publishDebugPath(mob, result.path);
                         if (!result.buildActions.isEmpty()) {
                             BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(result.buildActions.values()));
                             if (ChallengeMod.isAStarDebugEnabled() && result.found) {
@@ -694,7 +691,7 @@ public class MobPathManager {
                         }
                     } else {
                         pathCache.remove(mob.getUUID());
-                        clearClientPath(mob);
+                        removeDebugPath(mob);
                         BuildPlanData.removeBuildPlan(mob.getUUID());
                         pathFailures.put(mob.getUUID(), System.currentTimeMillis());
                         return false;
@@ -718,7 +715,7 @@ public class MobPathManager {
             if (mob.tickCount % 10 == 0) {
                 List<BlockPos> remaining = cached.remainingPath();
                 if (!remaining.isEmpty()) {
-                    syncPathToClients(mob, remaining);
+                    publishDebugPath(mob, remaining);
                 }
                 if (!cached.buildActions.isEmpty()) {
                     BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
@@ -730,7 +727,7 @@ public class MobPathManager {
                 if (buildTarget != null) {
                     if (!mobGriefing) {
                         pathCache.remove(mob.getUUID());
-                        clearClientPath(mob);
+                        removeDebugPath(mob);
                         BuildPlanData.removeBuildPlan(mob.getUUID());
                         if (ChallengeMod.isAStarDebugEnabled()) {
                             ChallengeMod.LOGGER.debug("[BuildPlan] mob={} cancelled reason=mobGriefing_disabled",
@@ -873,7 +870,7 @@ public class MobPathManager {
                                         mob.getUUID().toString().substring(0, 4), cached.strategy, nextNode);
                             }
                             pathCache.remove(mob.getUUID());
-                            clearClientPath(mob);
+                            removeDebugPath(mob);
                             BuildPlanData.removeBuildPlan(mob.getUUID());
                             return false;
                         }
@@ -1028,7 +1025,10 @@ public class MobPathManager {
         return adopted;
     }
 
-    /** Quick validity: endpoints free and a few samples not newly solid. */
+    /**
+     * Quick validity: endpoints free and a few samples not newly solid.
+     * Pure check — invalidation of the shared route is the caller's job.
+     */
     private static boolean isSharedRouteStillOpen(Level level, SharedFreeRoute free) {
         if (free == null || free.path.isEmpty()) {
             return false;
@@ -1040,13 +1040,11 @@ public class MobPathManager {
         for (int i = 0; i < path.size() - 1; i += step) {
             BlockPos n = path.get(i);
             if (isSolid(level, n) || isSolid(level, n.above())) {
-                sharedFreeRoute = null;
                 return false;
             }
         }
         // Last node: allow player cell; reject if end is solid and not just path end marker
         if (path.size() > 1 && isSolid(level, end) && isSolid(level, end.above())) {
-            sharedFreeRoute = null;
             return false;
         }
         return true;
@@ -1078,6 +1076,31 @@ public class MobPathManager {
         return horiz < 1.25 && Math.abs(dy) < 0.75;
     }
 
+    // Enter-hole phase bounds — shared by assistClimbTo and MobEntityMixin so the
+    // velocity-ownership handoff never drifts apart when tuned.
+    private static final double ENTER_HOLE_MAX_UP = 1.15;
+    private static final double ENTER_HOLE_MIN_UP = -0.6;
+    private static final double ENTER_HOLE_MAX_HORIZ = 2.25;
+
+    /**
+     * True when the mob is close enough to an open path cell that assistClimbTo owns
+     * velocity (ENTER phase). Other steering (wall climb, gap jump) must yield.
+     */
+    public static boolean isEnterHolePhase(Mob mob, BlockPos node) {
+        if (node == null) {
+            return false;
+        }
+        Level level = mob.level();
+        if (isSolid(level, node) || isSolid(level, node.above())) {
+            return false;
+        }
+        double needUp = node.getY() - mob.getY();
+        double dx = node.getX() + 0.5 - mob.getX();
+        double dz = node.getZ() + 0.5 - mob.getZ();
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        return needUp < ENTER_HOLE_MAX_UP && needUp > ENTER_HOLE_MIN_UP && horiz < ENTER_HOLE_MAX_HORIZ;
+    }
+
     /**
      * Move toward a path node. Handles climb AND vaulting into open wall holes without
      * bounce-spamming at the lip.
@@ -1100,9 +1123,8 @@ public class MobPathManager {
             dz = 0;
         }
 
-        boolean holeOpen = !isSolid(level, node) && !isSolid(level, node.above());
         // Near target height and hole is open → ENTER (no bounce-jump)
-        boolean enterPhase = holeOpen && needUp < 1.15 && needUp > -0.6 && horiz < 2.25;
+        boolean enterPhase = isEnterHolePhase(mob, node);
 
         if (enterPhase) {
             // Stop vanilla nav and move control (they recompute velocity later in
@@ -1378,11 +1400,11 @@ public class MobPathManager {
         return h < 0 ? 0f : h;
     }
 
-    private static void syncPathToClients(Mob mob, List<BlockPos> path) {
+    private static void publishDebugPath(Mob mob, List<BlockPos> path) {
         PathDebugData.setMobPath(mob.getUUID(), path);
     }
 
-    private static void clearClientPath(Mob mob) {
+    private static void removeDebugPath(Mob mob) {
         PathDebugData.removeMobPath(mob.getUUID());
     }
 
@@ -1452,7 +1474,6 @@ public class MobPathManager {
         mobBreachGen.clear();
         breachGeneration = 0;
         sharedFreeRoute = null;
-        freeRouteBoostUntilTick = 0;
         lastMetadataCleanupTick = Long.MIN_VALUE;
     }
 

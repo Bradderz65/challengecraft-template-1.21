@@ -91,14 +91,6 @@ public class MobBuilderHandler {
     }
 
     /**
-     * Get the target position the mob is currently building towards
-     */
-    public static BlockPos getPlannedTarget(Mob mob) {
-        BuildingState state = buildingStates.get(mob.getUUID());
-        return state != null ? state.lockedTargetPos : null;
-    }
-
-    /**
      * Calculate a pillar build plan to reach an elevated target.
      * Always builds DIRECTLY under the target position.
      */

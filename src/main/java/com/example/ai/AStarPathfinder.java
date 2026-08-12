@@ -133,11 +133,6 @@ public class AStarPathfinder {
         public final double pathCost;
 
         public PathResult(List<BlockPos> path, boolean found, boolean isPartial, int nodesExplored,
-                Map<BlockPos, BlockPos> buildActions) {
-            this(path, found, isPartial, nodesExplored, buildActions, 0);
-        }
-
-        public PathResult(List<BlockPos> path, boolean found, boolean isPartial, int nodesExplored,
                 Map<BlockPos, BlockPos> buildActions, double pathCost) {
             this.path = path;
             this.found = found;
@@ -157,30 +152,12 @@ public class AStarPathfinder {
         }
     }
 
-    public static PathResult findPath(Mob mob, BlockPos target) {
-        return findPath(mob, mob.blockPosition(), target, false, false);
-    }
-
-    public static PathResult findPath(Mob mob, BlockPos target, boolean allowBreaking) {
-        return findPath(mob, mob.blockPosition(), target, allowBreaking, false);
-    }
-
-    public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking) {
-        return findPath(mob, start, target, allowBreaking, false);
-    }
-
-    public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking,
-            boolean allowBuilding) {
-        return findPath(mob, start, target, allowBreaking, allowBuilding, Float.MAX_VALUE);
-    }
-
     public static PathResult findPath(Mob mob, BlockPos start, BlockPos target, boolean allowBreaking,
             boolean allowBuilding, float maxHardness) {
         Level level = mob.level();
 
-        if (start.equals(target) || isGoal(level, start, target, allowBreaking, maxHardness)) {
-            return new PathResult(Collections.singletonList(start.equals(target) ? target : start), true, false, 0,
-                    null, 0);
+        if (start.equals(target)) {
+            return new PathResult(Collections.singletonList(target), true, false, 0, null, 0);
         }
 
         int nodeBudget = nodeBudget(start, target);
@@ -222,7 +199,8 @@ public class AStarPathfinder {
                 closestNode = current;
             }
 
-            if (isGoal(level, current.pos, target, allowBreaking, maxHardness)) {
+            // A route succeeds only when it actually reaches the target cell
+            if (current.pos.equals(target)) {
                 return reconstructPathResult(current, nodesExplored, true, false);
             }
 
@@ -335,14 +313,7 @@ public class AStarPathfinder {
     /** Scale search budget with distance — short hunts stay cheap. */
     private static int nodeBudget(BlockPos start, BlockPos target) {
         double dist = Math.sqrt(start.distSqr(target));
-        int budget = 350 + (int) (dist * 45.0);
-        return Math.min(MAX_NODES_HARD, Math.max(500, budget));
-    }
-
-    /** A route succeeds only when it actually reaches the target cell. */
-    private static boolean isGoal(Level level, BlockPos current, BlockPos target, boolean allowBreaking,
-            float maxHardness) {
-        return current.equals(target);
+        return (int) Math.clamp(350 + dist * 45.0, 500, MAX_NODES_HARD);
     }
 
     private static PathResult reconstructPathResult(PathNode goal, int nodesExplored, boolean found,
@@ -394,6 +365,7 @@ public class AStarPathfinder {
         }
 
         int digDepth = digTwo ? 2 : 1;
+        double shaftDig = 0.0; // dig cost of solid cells passed through on the way down
         for (int drop = digDepth; drop <= digDepth + 5; drop++) {
             BlockPos candidate = current.pos.below(drop);
             if (!level.isInWorldBounds(candidate) || !level.hasChunkAt(candidate)) {
@@ -402,22 +374,26 @@ public class AStarPathfinder {
             if (isDanger(level, candidate) || isDanger(level, candidate.below())) {
                 break;
             }
-            BlockState under = level.getBlockState(candidate.below());
-            if (!(under.blocksMotion() || under.liquid())) {
-                continue;
-            }
 
-            double total = baseDig + drop * DROP_PER_BLOCK;
+            double feetDig = 0.0;
             BlockState feet = level.getBlockState(candidate);
             if (feet.blocksMotion()) {
                 float fh = feet.getDestroySpeed(level, candidate);
                 if (fh < 0 || fh > maxHardness) {
-                    continue;
+                    break; // unbreakable cell blocks the shaft — no deeper landing reachable
                 }
-                total += digCost(level, candidate, maxHardness);
+                feetDig = digCost(level, candidate, maxHardness);
             }
-            processNeighborWithExtraCost(current, candidate, openSet, closedSet, allNodes, target, total, null);
-            break;
+
+            BlockState under = level.getBlockState(candidate.below());
+            if (under.blocksMotion() || under.liquid()) {
+                processNeighborWithExtraCost(current, candidate, openSet, closedSet, allNodes, target,
+                        baseDig + shaftDig + feetDig + drop * DROP_PER_BLOCK, null);
+                break;
+            }
+
+            // Keep falling — a solid cell here must be dug through before descending further
+            shaftDig += feetDig;
         }
     }
 

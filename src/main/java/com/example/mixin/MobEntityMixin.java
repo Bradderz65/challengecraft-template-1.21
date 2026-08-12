@@ -149,10 +149,7 @@ public abstract class MobEntityMixin {
 					// If distance > 2.25 (1.5 blocks), it's a gap jump.
 					// Also ensure we are facing it roughly? Or just force velocity.
 					if (distSqrHorizontal > 2.25 && nextDeltaY == 1 && hasLanding) {
-						BlockPos n0 = nextNode;
-						boolean holeEnter = !mob.level().getBlockState(n0).blocksMotion()
-								&& !mob.level().getBlockState(n0.above()).blocksMotion()
-								&& n0.getY() - mob.getY() < 1.15 && n0.getY() - mob.getY() > -0.6;
+						boolean holeEnter = com.example.ai.MobPathManager.isEnterHolePhase(mob, nextNode);
 						// Enter-hole phase already owns velocity (assistClimbTo); do not gap-jump over it.
 						if (!holeEnter) {
 							mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
@@ -268,18 +265,8 @@ public abstract class MobEntityMixin {
 		// When A* is in its ENTER-HOLE phase, assistClimbTo already moves the mob
 		// into the open cell. If this wall-climb block also writes velocity, the two
 		// fight every tick and the mob bounces forever at the lip. Skip it entirely.
-		boolean enterHoleActive = false;
-		if (usingAStar && cachedPath != null && !cachedPath.isComplete()) {
-			BlockPos n = cachedPath.getNextNode();
-			if (n != null && !mob.level().getBlockState(n).blocksMotion()
-					&& !mob.level().getBlockState(n.above()).blocksMotion()) {
-				double enterNeedUp = n.getY() - mob.getY();
-				double enterDx = n.getX() + 0.5 - mob.getX();
-				double enterDz = n.getZ() + 0.5 - mob.getZ();
-				double enterHoriz = Math.sqrt(enterDx * enterDx + enterDz * enterDz);
-				enterHoleActive = enterNeedUp < 1.15 && enterNeedUp > -0.6 && enterHoriz < 2.25;
-			}
-		}
+		boolean enterHoleActive = usingAStar && cachedPath != null && !cachedPath.isComplete()
+				&& com.example.ai.MobPathManager.isEnterHolePhase(mob, cachedPath.getNextNode());
 
 		if (!enterHoleActive && !pathIsLateralDetour && (mob.horizontalCollision || isNextToWall)
 				&& (targetAbove || maintenanceHover)) {
@@ -401,10 +388,7 @@ public abstract class MobEntityMixin {
 
 		// Anti-Clumping / Pillar Chasing Logic / Smart Siege
 		// Radius increased to allow mobs to find path to pillars from afar
-		// Note: Variables verticalDiff and horizontalDistSqr are calculated above
-		verticalDiff = target.getY() - mob.getY();
-		horizontalDistSqr = mob.distanceToSqr(target.getX(), mob.getY(), target.getZ());
-
+		// verticalDiff and horizontalDistSqr were computed above (position unchanged this tick)
 		if (!usingAStar && verticalDiff > 2.0) {
 			// If we are somewhat close to the tower base (within 20 blocks)
 			if (horizontalDistSqr < 400.0) {
