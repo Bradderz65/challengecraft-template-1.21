@@ -162,8 +162,8 @@ public abstract class MobEntityMixin {
 								// Explicitly push towards target to ensure we clear the gap
 								Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
 								double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
-								if (currentSpeed < 0.3) {
-									mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.15)));
+								if (currentSpeed < 0.18) {
+									mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.08)));
 								}
 							}
 						} else {
@@ -210,9 +210,6 @@ public abstract class MobEntityMixin {
 			wallAttraction = wallAttraction.add(-1, 0, 0);
 
 		boolean isNextToWall = wallAttraction.lengthSqr() > 0;
-		if (isNextToWall) {
-			wallAttraction = wallAttraction.normalize();
-		}
 
 		// Determine steering target (Path Node OR Player)
 		// We calculate this early to decide if we need to climb
@@ -221,7 +218,15 @@ public abstract class MobEntityMixin {
 		if (cachedPath != null && !cachedPath.isComplete()) {
 			BlockPos node = cachedPath.getNextNode();
 			if (node != null) {
-				steeringTarget = new Vec3(node.getX() + 0.5, node.getY(), node.getZ() + 0.5);
+				BlockPos steeringNode = node;
+				// Pure vertical climb nodes have no horizontal direction. Look one node
+				// ahead so climbers can traverse sideways along the wall while ascending.
+				if (node.getX() == mob.blockPosition().getX()
+						&& node.getZ() == mob.blockPosition().getZ()
+						&& cachedPath.currentNodeIndex + 1 < cachedPath.path.size()) {
+					steeringNode = cachedPath.path.get(cachedPath.currentNodeIndex + 1);
+				}
+				steeringTarget = new Vec3(steeringNode.getX() + 0.5, node.getY(), steeringNode.getZ() + 0.5);
 			}
 		}
 
@@ -320,7 +325,8 @@ public abstract class MobEntityMixin {
 					// breaking
 					climbY = 0.0;
 				}
-				double latchSpeed = 0.2;
+				double normalSpeed = Math.max(0.08, mob.getAttributeValue(Attributes.MOVEMENT_SPEED));
+				double latchSpeed = Math.min(0.18, normalSpeed * speed);
 
 				boolean isVaulting = Math.abs(steeringTarget.y - mob.getY()) < 1.5;
 				double distSq = (steeringTarget.x - mob.getX()) * (steeringTarget.x - mob.getX())
@@ -338,7 +344,7 @@ public abstract class MobEntityMixin {
 
 				if (isVaulting && openHole && distSq < 6.25) {
 					// ENTER HOLE: strong horizontal into open cell, almost no upward bounce
-					latchSpeed = distSq < 0.36 ? 0.22 : 0.42;
+					latchSpeed = Math.min(distSq < 0.36 ? 0.16 : 0.24, normalSpeed * speed * 1.35);
 					double belowLip = steeringTarget.y - mob.getY();
 					if (belowLip > 0.35) {
 						climbY = 0.28;
@@ -355,7 +361,7 @@ public abstract class MobEntityMixin {
 					mob.fallDistance = 0.0F;
 				} else if (isVaulting) {
 					// VAULTING onto solid ledge
-					latchSpeed = distSq < 0.25 ? 0.12 : 0.28;
+					latchSpeed = Math.min(distSq < 0.25 ? 0.12 : 0.20, normalSpeed * speed * 1.2);
 					climbY = mob.getY() < steeringTarget.y - 0.2 ? 0.22 : 0.08;
 					mob.setDeltaMovement(new Vec3(pushDir.x * latchSpeed, climbY, pushDir.z * latchSpeed));
 					mob.fallDistance = 0.0F;

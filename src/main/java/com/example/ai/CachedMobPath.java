@@ -24,6 +24,9 @@ public final class CachedMobPath {
     public final boolean partial;
     public final float maxBreakHardness;
 
+    /** Shared free-route identity, or -1 for an independently planned path. */
+    public long sharedRouteId = -1L;
+
     public int currentNodeIndex;
     public int placeDelay;
     public long lastRecalcTick;
@@ -72,7 +75,7 @@ public final class CachedMobPath {
             String buildInfo = next != null && buildActions.containsKey(next)
                     ? " (Needs Build at " + buildActions.get(next) + ")"
                     : "";
-            ChallengeMod.LOGGER.warn("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}",
+            ChallengeMod.LOGGER.info("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}",
                     mob.getUUID().toString().substring(0, 4), currentPos, stuckTicks, next, buildInfo);
         }
     }
@@ -111,6 +114,10 @@ public final class CachedMobPath {
     }
 
     public boolean isExpired(long currentTick) {
+        // Shared routes are invalidated by world/target validation, not an arbitrary timer.
+        if (sharedRouteId >= 0) {
+            return false;
+        }
         long lifetime = partial ? PARTIAL_PATH_LIFETIME_TICKS : FULL_PATH_LIFETIME_TICKS;
         return currentTick - lastRecalcTick > lifetime;
     }

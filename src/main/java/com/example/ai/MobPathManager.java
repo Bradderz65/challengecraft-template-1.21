@@ -5,6 +5,7 @@ import com.example.antitower.MobBreakerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
@@ -59,11 +60,8 @@ public class MobPathManager {
     private static final int MAX_PATH_CALCS_PER_TICK = 1;
     private static final double TPS_CUTOFF = 18.0;
 
-    /** How far a mob may be from the free corridor and still be forced onto it. */
-    private static final double FREE_ROUTE_JOIN_RANGE = 48.0;
-    /** Within this, snap onto corridor; beyond, walk toward entry (no extra A*). */
-    private static final double FREE_ROUTE_SNAP_RANGE = 18.0;
-    private static final long FREE_ROUTE_FRESH_MS = 25_000;
+    /** Only truly adjacent mobs may snap directly onto a corridor node. */
+    private static final double FREE_ROUTE_SNAP_RANGE = 2.5;
 
     // Swarm Intelligence: planned breaches + live break progress (0–1)
     private static final Map<DimPos, Long> plannedBreaches = new ConcurrentHashMap<>();
@@ -88,6 +86,15 @@ public class MobPathManager {
      * every other mob adopts it (snap to nearest node) — no per-mob A* required.
      */
     private static volatile SharedFreeRoute sharedFreeRoute = null;
+    private static long nextSharedRouteId = 1L;
+    /** Failed connector searches wait before retrying; successful adopted paths never rejoin each tick. */
+    private static final Map<UUID, Long> freeRouteRetryAfterTick = new ConcurrentHashMap<>();
+    /** Route ID a mob has already completed; cleared naturally when a new route is published. */
+    private static final Map<UUID, Long> completedSharedRoute = new ConcurrentHashMap<>();
+    private static final int FREE_ROUTE_RETRY_TICKS = 40;
+    private static final int MIN_SHARED_ROUTE_NODES = 6;
+    /** Keep the proven corridor while the player moves locally around its endpoint. */
+    private static final double FREE_ROUTE_TARGET_RADIUS = 4.5;
 
     private static final class SharedFreeRoute {
         final ResourceKey<Level> dimension;
@@ -95,37 +102,22 @@ public class MobPathManager {
         final BlockPos playerPos;
         /** Outside-most node (farthest from player) — pack approaches here. */
         final BlockPos entryPos;
-        final long createdMs;
-        final long generation;
+        final long id;
+        /** Corridor geometry is identical for every mob; validate it once per server tick. */
+        long lastValidationTick = Long.MIN_VALUE;
+        boolean lastValidationResult;
 
-        SharedFreeRoute(ResourceKey<Level> dimension, List<BlockPos> path, BlockPos playerPos, long generation) {
+        SharedFreeRoute(ResourceKey<Level> dimension, List<BlockPos> path, BlockPos playerPos, long id) {
             this.dimension = dimension;
             this.path = List.copyOf(path);
             this.playerPos = playerPos.immutable();
             this.entryPos = pickEntryNode(this.path, this.playerPos);
-            this.createdMs = System.currentTimeMillis();
-            this.generation = generation;
+            this.id = id;
         }
 
-        boolean isFresh() {
-            return System.currentTimeMillis() - createdMs < FREE_ROUTE_FRESH_MS;
-        }
-
-        /** Prefer the node on the path farthest from the player (corridor mouth). */
+        /** A* paths are ordered start-to-target, so the first node is the proven mouth. */
         private static BlockPos pickEntryNode(List<BlockPos> path, BlockPos playerPos) {
-            if (path.isEmpty()) {
-                return playerPos;
-            }
-            BlockPos best = path.get(0);
-            double bestDist = -1;
-            for (BlockPos n : path) {
-                double d = n.distSqr(playerPos);
-                if (d > bestDist) {
-                    bestDist = d;
-                    best = n;
-                }
-            }
-            return best;
+            return path.isEmpty() ? playerPos : path.get(0);
         }
     }
 
@@ -220,7 +212,10 @@ public class MobPathManager {
      * Rejects 1-node / exterior-adjacent fakes that freeze the pack outside the player.
      */
     public static void publishFreeRoute(Level level, List<BlockPos> path, BlockPos playerPos) {
-        if (path == null || path.isEmpty()) {
+        if (path == null || path.size() < MIN_SHARED_ROUTE_NODES) {
+            if (ChallengeMod.isAStarDebugEnabled() && path != null) {
+                ChallengeMod.LOGGER.info("[FreeRoute] rejected nodes={} reason=too_short", path.size());
+            }
             return;
         }
         if (!isValidFreeRoute(level, path, playerPos)) {
@@ -233,18 +228,19 @@ public class MobPathManager {
         }
         SharedFreeRoute prev = sharedFreeRoute;
         // Keep a good shared route; refresh player anchor if they moved a little
-        if (prev != null && prev.isFresh() && prev.dimension.equals(level.dimension())
-                && prev.playerPos.closerThan(playerPos, 6.0)
-                && isValidFreeRoute(level, prev.path, playerPos)
+        if (prev != null && prev.dimension.equals(level.dimension())
+                && prev.playerPos.closerThan(playerPos, FREE_ROUTE_TARGET_RADIUS)
+                && isSharedRouteStillOpen(level, prev)
                 && pathsShareEndpoint(prev.path, path)) {
-            if (prev.playerPos.distSqr(playerPos) > 2.25) {
-                sharedFreeRoute = new SharedFreeRoute(level.dimension(), prev.path, playerPos, prev.generation);
-            }
+            // Preserve the corridor and its identity. The last few blocks are handled
+            // by normal navigation, so local player movement does not repath the swarm.
             return;
         }
-        boolean isNew = prev == null || !prev.isFresh() || !prev.dimension.equals(level.dimension())
+        boolean isNew = prev == null || !prev.dimension.equals(level.dimension())
+                || !prev.playerPos.closerThan(playerPos, FREE_ROUTE_TARGET_RADIUS)
                 || !pathsShareEndpoint(prev.path, path);
-        sharedFreeRoute = new SharedFreeRoute(level.dimension(), path, playerPos, breachGeneration);
+        long routeId = isNew ? nextSharedRouteId++ : prev.id;
+        sharedFreeRoute = new SharedFreeRoute(level.dimension(), path, playerPos, routeId);
         for (BlockPos n : path) {
             if (!isSolid(level, n)) {
                 DimPos k = new DimPos(level.dimension(), n.immutable());
@@ -254,7 +250,7 @@ public class MobPathManager {
         if (isNew) {
             bumpSwarmGeneration();
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.debug(
+                ChallengeMod.LOGGER.info(
                         "[FreeRoute] published nodes={} entry={} end={} — ALL mobs funnel",
                         path.size(),
                         sharedFreeRoute.entryPos,
@@ -300,22 +296,35 @@ public class MobPathManager {
 
     /** Invalidate free route if it no longer qualifies (player moved / wall sealed). */
     private static boolean isFreeRouteUsable(Level level, SharedFreeRoute free, BlockPos playerPos) {
-        if (free == null || !free.isFresh()) {
+        if (free == null) {
             return false;
         }
         if (!free.dimension.equals(level.dimension())) {
             return false;
         }
-        if (!free.playerPos.closerThan(playerPos, 8.0)) {
-            return false;
-        }
-        if (!isValidFreeRoute(level, free.path, playerPos)) {
-            return false;
-        }
-        if (!isSharedRouteStillOpen(level, free)) {
-            // Corridor sealed — drop it so the pack replans
+        // Keep the proven corridor while the player moves locally around its endpoint.
+        // The endpoint itself remains the corridor anchor; direct navigation handles
+        // the short final approach to the player's current cell.
+        if (!free.playerPos.closerThan(playerPos, FREE_ROUTE_TARGET_RADIUS)) {
             if (sharedFreeRoute == free) {
                 sharedFreeRoute = null;
+                bumpSwarmGeneration();
+            }
+            return false;
+        }
+        if (!isValidFreeRoute(level, free.path, free.playerPos)) {
+            return false;
+        }
+        if (!isSharedRouteStillOpenCached(level, free)) {
+            // Corridor sealed — drop it so the pack replans.
+            if (sharedFreeRoute == free) {
+                sharedFreeRoute = null;
+                bumpSwarmGeneration();
+                if (ChallengeMod.isAStarDebugEnabled()) {
+                    ChallengeMod.LOGGER.info(
+                            "[FreeRoute] invalidated reason=blocked_or_unloaded entry={} target={}",
+                            free.entryPos, free.playerPos);
+                }
             }
             return false;
         }
@@ -469,39 +478,74 @@ public class MobPathManager {
         // If ANY mob proved a REAL free walk into the player, EVERYONE funnels through it
         SharedFreeRoute free = sharedFreeRoute;
         boolean freeAvailable = isFreeRouteUsable(mob.level(), free, targetPos);
-        if (!freeAvailable && free != null && free.isFresh()) {
-            // Drop invalid exterior freezes so dig / SoftBreak can run again
+        if (!freeAvailable && free != null) {
+            // Drop invalid routes so dig / SoftBreak can run again.
             if (free.dimension.equals(mob.level().dimension())
-                    && !isValidFreeRoute(mob.level(), free.path, targetPos)) {
+                    && (!free.playerPos.closerThan(targetPos, FREE_ROUTE_TARGET_RADIUS)
+                    || !isValidFreeRoute(mob.level(), free.path, free.playerPos)
+                    || !isSharedRouteStillOpenCached(mob.level(), free))) {
+                BlockPos invalidTarget = free.playerPos;
                 sharedFreeRoute = null;
                 free = null;
-                if (ChallengeMod.isAStarDebugEnabled() && currentTick % 40 == 0) {
-                    ChallengeMod.LOGGER.debug("[FreeRoute] cleared invalid exterior route");
+                if (ChallengeMod.isAStarDebugEnabled()) {
+                    ChallengeMod.LOGGER.info("[FreeRoute] invalidated route target={} currentTarget={}",
+                            invalidTarget, targetPos);
                 }
             }
         }
+        // A cached shared path is meaningful only while its exact authoritative route exists.
+        if (!freeAvailable && cached != null && cached.sharedRouteId >= 0) {
+            pathCache.remove(mob.getUUID());
+            removeDebugPath(mob);
+            cached = null;
+        }
+
         boolean onFreeCorridor = false;
 
         if (freeAvailable && free != null) {
-            boolean alreadyOnFree = cached != null && !cached.partial && "Standard".equals(cached.strategy)
-                    && pathsShareEndpoint(cached.path, free.path)
-                    && !cached.isStuckLong()
-                    && isOnOrNearFreeRoute(mob, free);
+            boolean completedThisRoute = completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id;
+            boolean hasThisSharedRoute = cached != null && cached.sharedRouteId == free.id;
+            boolean finishedSharedRoute = hasThisSharedRoute && cached.isComplete();
+            boolean alreadyOnFree = hasThisSharedRoute && !cached.isComplete();
 
-            // Partials, dig routes, stuck, swarm, or not near corridor → force onto free path
-            // Never run extra A* here — free route adopt is the cheap path for the pack.
-            if (!alreadyOnFree || swarmRepath || (cached != null && (cached.partial || !"Standard".equals(cached.strategy)))) {
+            // A stuck connector may be rebuilt, but it must never fall through to an
+            // independent player path while this shared route remains valid.
+            if (hasThisSharedRoute && cached.isStuckLong() && !finishedSharedRoute) {
+                pathCache.remove(mob.getUUID());
+                removeDebugPath(mob);
+                cached = null;
+                hasThisSharedRoute = false;
+                alreadyOnFree = false;
+                freeRouteRetryAfterTick.put(mob.getUUID(), currentTick + FREE_ROUTE_RETRY_TICKS);
+            }
+
+            // A mob that reached the corridor endpoint is done with the shared route.
+            // Return false below so vanilla navigation handles the nearby moving player.
+            if (finishedSharedRoute) {
+                completedSharedRoute.put(mob.getUUID(), free.id);
+                pathCache.remove(mob.getUUID());
+                removeDebugPath(mob);
+                cached = null;
+                completedThisRoute = true;
+            }
+
+            // Partials, dig routes, or stuck paths adopt the authoritative corridor once.
+            if (!alreadyOnFree && !finishedSharedRoute && !completedThisRoute) {
                 CachedMobPath adopted = joinFreeRoute(mob, free, targetPos, currentTick);
                 if (adopted != null) {
                     cached = adopted;
                     pathCache.put(mob.getUUID(), cached);
-                    BuildPlanData.removeBuildPlan(mob.getUUID());
+                    if (cached.buildActions.isEmpty()) {
+                        BuildPlanData.removeBuildPlan(mob.getUUID());
+                    } else {
+                        BuildPlanData.setBuildPlan(mob.getUUID(), new ArrayList<>(cached.buildActions.values()));
+                    }
                     publishDebugPath(mob, cached.remainingPath());
                     onFreeCorridor = true;
                     swarmRepath = false;
-                    if (ChallengeMod.isAStarDebugEnabled() && currentTick % 40 == 0) {
-                        ChallengeMod.LOGGER.debug(
-                                "[FreeRoute] mob={} funnel nodes={} idx={} entry={}",
+                    if (ChallengeMod.isAStarDebugEnabled()) {
+                        ChallengeMod.LOGGER.info(
+                                "[FreeRoute] mob={} adopted nodes={} idx={} entry={}",
                                 mob.getUUID().toString().substring(0, 4),
                                 cached.path.size(),
                                 cached.currentNodeIndex,
@@ -525,8 +569,12 @@ public class MobPathManager {
                 && !cached.partial
                 && "Standard".equals(cached.strategy);
 
-        // On free corridor: only replan if stuck/expired — never dig another wall
-        boolean needsRecalculation = !onFreeCorridor && (cached == null
+        // On a free corridor, only replan if stuck/invalid. A completed shared route
+        // deliberately hands off to vanilla navigation instead of starting another A*.
+        boolean localFinalApproach = freeAvailable && cached == null
+                && (completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id
+                || currentTick < freeRouteRetryAfterTick.getOrDefault(mob.getUUID(), Long.MIN_VALUE));
+        boolean needsRecalculation = !onFreeCorridor && !localFinalApproach && (cached == null
                 || cached.isExpired(currentTick)
                 || cached.isComplete()
                 || cached.isStuckLong()
@@ -552,6 +600,15 @@ public class MobPathManager {
 
         if (pathLocked) {
             needsRecalculation = false;
+        }
+
+        // A valid shared route is authoritative. Adoption above is the only operation
+        // allowed to replace the mob's path; if a connector is throttled or fails, keep
+        // following the existing path and retry later instead of generating a competing
+        // partial route to the player.
+        if (freeAvailable) {
+            needsRecalculation = false;
+            swarmRepath = false;
         }
 
         boolean stuckReplan = cached != null && cached.isStuckLong();
@@ -581,28 +638,15 @@ public class MobPathManager {
             if (pathCalcsPerTick < MAX_PATH_CALCS_PER_TICK) {
                 if (cached == null || stuckReplan || swarmRepath || freeAvailable
                         || currentTick - cached.lastRecalcTick >= replanInterval) {
-                    pathCalcsPerTick++;
                     BlockPos start = mob.blockPosition();
 
                     // Unified A*: costs decide walk vs dig vs place (one search).
-                    // Free corridor share: if pack already has a proven route, join it first (no A*).
+                    // Shared-route adoption is handled above and never enters this branch.
                     AStarPathfinder.PathResult result;
                     String strategy;
+                    pathCalcsPerTick++;
 
-                    if (freeAvailable) {
-                        CachedMobPath joined = joinFreeRoute(mob, free, targetPos, currentTick);
-                        if (joined != null) {
-                            result = new AStarPathfinder.PathResult(joined.path, true, false, 0,
-                                    Collections.emptyMap(), 0);
-                            strategy = "Standard";
-                        } else if (mobGriefing) {
-                            result = AStarPathfinder.findPath(mob, start, targetPos, true, true, Float.MAX_VALUE);
-                            strategy = result.usable() ? classifyPath(mob.level(), result) : "Standard";
-                        } else {
-                            result = AStarPathfinder.findPath(mob, start, targetPos, false, false, 0);
-                            strategy = "Standard";
-                        }
-                    } else if (mobGriefing) {
+                    if (mobGriefing) {
                         // Smart graph only: break/build edge costs pick the best plan
                         result = AStarPathfinder.findPath(mob, start, targetPos, true, true, Float.MAX_VALUE);
                         strategy = result.usable() ? classifyPath(mob.level(), result) : "Standard";
@@ -645,7 +689,7 @@ public class MobPathManager {
                         if (ChallengeMod.isAStarDebugEnabled() && ChallengeMod.LOGGER.isDebugEnabled()
                                 && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                             cached.lastBuildLogTick = currentTick;
-                            ChallengeMod.LOGGER.debug(
+                            ChallengeMod.LOGGER.info(
                                     "[Path] mob={} strategy={} partial={} nodes={} maxY={} cost={} maxBreakH={} end={}",
                                     mob.getUUID().toString().substring(0, 4),
                                     strategy,
@@ -928,87 +972,111 @@ public class MobPathManager {
         return true;
     }
 
-    private static int nearestFreeIndex(BlockPos mobPos, List<BlockPos> path) {
-        int best = -1;
-        double bestDist = Double.MAX_VALUE;
-        for (int i = 0; i < path.size(); i++) {
-            double d = path.get(i).distSqr(mobPos);
-            if (d < bestDist) {
-                bestDist = d;
-                best = i;
+    /** Prefer an adjacent reachable route node; otherwise join at the corridor mouth. */
+    private static int selectJoinIndex(Level level, BlockPos mobPos, SharedFreeRoute free) {
+        int entryIndex = Math.max(0, free.path.indexOf(free.entryPos));
+        int bestLocal = -1;
+        double bestDistance = Double.MAX_VALUE;
+        for (int i = entryIndex; i < free.path.size(); i++) {
+            BlockPos node = free.path.get(i);
+            double distance = node.distSqr(mobPos);
+            if (distance <= FREE_ROUTE_SNAP_RANGE * FREE_ROUTE_SNAP_RANGE
+                    && distance < bestDistance
+                    && hasDirectLocalJoin(level, mobPos, node)) {
+                bestLocal = i;
+                bestDistance = distance;
             }
         }
-        return best;
+        return bestLocal >= 0 ? bestLocal : entryIndex;
     }
 
-    private static boolean isOnOrNearFreeRoute(Mob mob, SharedFreeRoute free) {
-        if (free == null || free.path.isEmpty()) {
+    /** A snap is safe only for a normal adjacent walk/step with clear body space. */
+    private static boolean hasDirectLocalJoin(Level level, BlockPos from, BlockPos to) {
+        int dx = Math.abs(to.getX() - from.getX());
+        int dz = Math.abs(to.getZ() - from.getZ());
+        int dy = to.getY() - from.getY();
+        if (dx > 1 || dz > 1 || dy < -1 || dy > 1) {
             return false;
         }
-        BlockPos mobPos = mob.blockPosition();
-        for (BlockPos n : free.path) {
-            if (mobPos.closerThan(n, 3.5)) {
-                return true;
+        if (isSolid(level, to) || isSolid(level, to.above())) {
+            return false;
+        }
+        BlockState floor = level.getBlockState(to.below());
+        if (!floor.blocksMotion() && !floor.liquid()) {
+            return false;
+        }
+        if (dx == 1 && dz == 1) {
+            BlockPos sideX = from.offset(to.getX() - from.getX(), 0, 0);
+            BlockPos sideZ = from.offset(0, 0, to.getZ() - from.getZ());
+            if (isSolid(level, sideX) || isSolid(level, sideX.above())
+                    || isSolid(level, sideZ) || isSolid(level, sideZ.above())) {
+                return false;
             }
         }
-        return mobPos.closerThan(free.entryPos, 4.0);
+        return true;
     }
 
     /**
-     * Force this mob onto the proven free corridor to the player.
-     * Near: snap onto path. Far: walk to corridor entry (or nearest node), then free path to player.
+     * Force this mob onto the proven free corridor to the player. Only adjacent,
+     * unobstructed mobs snap; every other mob requires a validated connector.
      */
     private static CachedMobPath joinFreeRoute(Mob mob, SharedFreeRoute free, BlockPos targetPos, long currentTick) {
-        if (free == null || free.path.isEmpty()) {
+        if (free == null || free.path.isEmpty()
+                || completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id
+                || currentTick < freeRouteRetryAfterTick.getOrDefault(mob.getUUID(), Long.MIN_VALUE)) {
             return null;
         }
         BlockPos mobPos = mob.blockPosition();
-        int best = nearestFreeIndex(mobPos, free.path);
-        if (best < 0) {
-            return null;
-        }
-        double bestDist = Math.sqrt(free.path.get(best).distSqr(mobPos));
-        // If nearest corridor node is still too far, aim at the corridor mouth (entry)
-        if (bestDist > FREE_ROUTE_JOIN_RANGE) {
-            int entryIdx = 0;
-            for (int i = 0; i < free.path.size(); i++) {
-                if (free.path.get(i).equals(free.entryPos)) {
-                    entryIdx = i;
-                    break;
-                }
-            }
-            best = entryIdx;
-            bestDist = Math.sqrt(free.path.get(best).distSqr(mobPos));
-            if (bestDist > FREE_ROUTE_JOIN_RANGE) {
-                return null; // outside hunt funnel range
-            }
-        }
-
+        int joinIndex = selectJoinIndex(mob.level(), mobPos, free);
+        BlockPos joinNode = free.path.get(joinIndex);
+        double joinDistance = Math.sqrt(joinNode.distSqr(mobPos));
         List<BlockPos> combined = new ArrayList<>();
+        Map<BlockPos, BlockPos> combinedBuildActions = Collections.emptyMap();
+        String combinedStrategy = "Standard";
 
-        if (bestDist <= FREE_ROUTE_SNAP_RANGE) {
-            // Already near corridor — ride it from nearest node to player
-            for (int i = best; i < free.path.size(); i++) {
+        if (joinDistance <= FREE_ROUTE_SNAP_RANGE
+                && hasDirectLocalJoin(mob.level(), mobPos, joinNode)) {
+            // Genuinely adjacent with an unobstructed local transition.
+            for (int i = joinIndex; i < free.path.size(); i++) {
                 combined.add(free.path.get(i));
             }
         } else {
-            // Far from the corridor: approach its entry without another A* search.
-            BlockPos join = bestDist > 10 ? free.entryPos : free.path.get(best);
-            if (bestDist > 10) {
-                for (int i = 0; i < free.path.size(); i++) {
-                    if (free.path.get(i).equals(free.entryPos)) {
-                        best = i;
-                        break;
-                    }
+            // A shared player route is authoritative, but each mob still needs a valid
+            // traversable connector to it. Connector searches share the same global
+            // one-search-per-tick budget as ordinary A* planning.
+            if (pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
+                    || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
+                return null;
+            }
+            pathCalcsPerTick++;
+            // Join the corridor mouth unless a later node was proven locally reachable.
+            BlockPos join = joinNode;
+            boolean canModifyTerrain = mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING);
+            AStarPathfinder.PathResult connector = AStarPathfinder.findPath(
+                    mob, mobPos, join, canModifyTerrain, canModifyTerrain,
+                    canModifyTerrain ? Float.MAX_VALUE : 0.0f);
+            if (!connector.found || connector.path == null || connector.path.isEmpty()) {
+                freeRouteRetryAfterTick.put(mob.getUUID(), currentTick + FREE_ROUTE_RETRY_TICKS);
+                if (ChallengeMod.isAStarDebugEnabled()) {
+                    ChallengeMod.LOGGER.info(
+                            "[FreeRoute] mob={} connector_failed from={} entry={} partial={} explored={}",
+                            mob.getUUID().toString().substring(0, 4), mobPos, join,
+                            connector.isPartial, connector.nodesExplored);
                 }
+                return null;
             }
-            if (!mobPos.closerThan(join, 1.5)) {
-                combined.add(join);
+            if (ChallengeMod.isAStarDebugEnabled()) {
+                ChallengeMod.LOGGER.info(
+                        "[FreeRoute] mob={} connector_found from={} entry={} nodes={}",
+                        mob.getUUID().toString().substring(0, 4), mobPos, join, connector.path.size());
             }
-            for (int i = best; i < free.path.size(); i++) {
-                BlockPos n = free.path.get(i);
-                if (combined.isEmpty() || !combined.get(combined.size() - 1).equals(n)) {
-                    combined.add(n);
+            combined.addAll(connector.path);
+            combinedBuildActions = connector.buildActions;
+            combinedStrategy = classifyPath(mob.level(), connector);
+            for (int i = Math.max(0, joinIndex); i < free.path.size(); i++) {
+                BlockPos node = free.path.get(i);
+                if (!combined.get(combined.size() - 1).equals(node)) {
+                    combined.add(node);
                 }
             }
         }
@@ -1017,17 +1085,36 @@ public class MobPathManager {
             combined.addAll(free.path);
         }
 
-        CachedMobPath adopted = new CachedMobPath(combined, targetPos, Collections.emptyMap(), "Standard", false);
+        CachedMobPath adopted = new CachedMobPath(
+                combined, targetPos, combinedBuildActions, combinedStrategy, false);
+        adopted.sharedRouteId = free.id;
         adopted.lastRecalcTick = currentTick;
+        if ("Building".equals(combinedStrategy)) {
+            adopted.buildLockUntilTick = currentTick + BUILD_PATH_LOCK_TICKS;
+        }
+        freeRouteRetryAfterTick.remove(mob.getUUID());
         adopted.snapToNearestNode(mob);
+        if (combined.size() == 1 && hasArrivedAtNode(mob, combined.get(0))) {
+            adopted.advanceNode();
+        }
         adopted.stuckTicks = 0;
         adopted.lastPos = mobPos;
         return adopted;
     }
 
+    /** Cache shared geometry validation because every mob queries the same route each tick. */
+    private static boolean isSharedRouteStillOpenCached(Level level, SharedFreeRoute free) {
+        long tick = level.getGameTime();
+        if (free.lastValidationTick == tick) {
+            return free.lastValidationResult;
+        }
+        free.lastValidationResult = isSharedRouteStillOpen(level, free);
+        free.lastValidationTick = tick;
+        return free.lastValidationResult;
+    }
+
     /**
-     * Quick validity: endpoints free and a few samples not newly solid.
-     * Pure check — invalidation of the shared route is the caller's job.
+     * Validate the complete shared corridor. Pure check; callers own invalidation.
      */
     private static boolean isSharedRouteStillOpen(Level level, SharedFreeRoute free) {
         if (free == null || free.path.isEmpty()) {
@@ -1035,11 +1122,11 @@ public class MobPathManager {
         }
         List<BlockPos> path = free.path;
         BlockPos end = path.get(path.size() - 1);
-        // End may be player cell (passable); intermediate solids mean sealed corridor
-        int step = Math.max(1, path.size() / 6);
-        for (int i = 0; i < path.size() - 1; i += step) {
+        // Validate every node: one sealed, unloaded, or changed cell invalidates the route.
+        for (int i = 0; i < path.size() - 1; i++) {
             BlockPos n = path.get(i);
-            if (isSolid(level, n) || isSolid(level, n.above())) {
+            if (!level.isInWorldBounds(n) || !level.hasChunkAt(n)
+                    || isSolid(level, n) || isSolid(level, n.above())) {
                 return false;
             }
         }
@@ -1078,9 +1165,9 @@ public class MobPathManager {
 
     // Enter-hole phase bounds — shared by assistClimbTo and MobEntityMixin so the
     // velocity-ownership handoff never drifts apart when tuned.
-    private static final double ENTER_HOLE_MAX_UP = 1.15;
+    private static final double ENTER_HOLE_MAX_UP = 1.85;
     private static final double ENTER_HOLE_MIN_UP = -0.6;
-    private static final double ENTER_HOLE_MAX_HORIZ = 2.25;
+    private static final double ENTER_HOLE_MAX_HORIZ = 2.5;
 
     /**
      * True when the mob is close enough to an open path cell that assistClimbTo owns
@@ -1091,8 +1178,14 @@ public class MobPathManager {
             return false;
         }
         Level level = mob.level();
-        if (isSolid(level, node) || isSolid(level, node.above())) {
+        if (isSolid(level, node)) {
             return false;
+        }
+        if (isSolid(level, node.above())) {
+            CachedMobPath cached = getCachedPath(mob);
+            if (cached == null || !canStrategyBreak(level, node.above(), cached.maxBreakHardness)) {
+                return false;
+            }
         }
         double needUp = node.getY() - mob.getY();
         double dx = node.getX() + 0.5 - mob.getX();
@@ -1101,9 +1194,25 @@ public class MobPathManager {
         return needUp < ENTER_HOLE_MAX_UP && needUp > ENTER_HOLE_MIN_UP && horiz < ENTER_HOLE_MAX_HORIZ;
     }
 
+    /** Horizontal assistance cap based on the mob's own vanilla movement attribute. */
+    private static double assistedHorizontalSpeed(Mob mob, double multiplier, double minimum, double maximum) {
+        double base = mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
+        return Math.clamp(base * multiplier, minimum, maximum);
+    }
+
+    private static void setAssistedVelocity(Mob mob, double x, double y, double z, double horizontalCap) {
+        double horizontal = Math.sqrt(x * x + z * z);
+        if (horizontal > horizontalCap && horizontal > 1.0E-7) {
+            double scale = horizontalCap / horizontal;
+            x *= scale;
+            z *= scale;
+        }
+        mob.setDeltaMovement(x, y, z);
+    }
+
     /**
-     * Move toward a path node. Handles climb AND vaulting into open wall holes without
-     * bounce-spamming at the lip.
+     * Move toward a path node. Ordinary travel stays vanilla; direct velocity is reserved
+     * for climbing and entering openings that vanilla navigation cannot execute.
      */
     private static void assistClimbTo(Mob mob, BlockPos node, double speed, CachedMobPath cached) {
         Level level = mob.level();
@@ -1118,6 +1227,25 @@ public class MobPathManager {
         if (horiz > 0.05) {
             dx /= horiz;
             dz /= horiz;
+        } else if (cached != null && node.getY() > mob.getY()) {
+            // A vertical node has no horizontal steering vector. While climbing,
+            // bias toward the next route segment (or final target) so mobs can move
+            // sideways along a wall instead of freezing in one vertical column.
+            BlockPos horizontalGoal = cached.targetPos;
+            int followingIndex = cached.currentNodeIndex + 1;
+            if (followingIndex < cached.path.size()) {
+                horizontalGoal = cached.path.get(followingIndex);
+            }
+            dx = horizontalGoal.getX() + 0.5 - mob.getX();
+            dz = horizontalGoal.getZ() + 0.5 - mob.getZ();
+            double steeringLength = Math.sqrt(dx * dx + dz * dz);
+            if (steeringLength > 0.05) {
+                dx /= steeringLength;
+                dz /= steeringLength;
+            } else {
+                dx = 0;
+                dz = 0;
+            }
         } else {
             dx = 0;
             dz = 0;
@@ -1139,8 +1267,8 @@ public class MobPathManager {
                 mob.getJumpControl().jump();
             }
 
-            // Strong horizontal INTO the hole; little/no extra upward once level
-            double push = 0.5 * Math.min(Math.max(speed, 1.0), 2.0);
+            // Controlled horizontal entry based on normal mob speed, not a fixed launch.
+            double push = assistedHorizontalSpeed(mob, speed * 1.35, 0.12, 0.28);
             double up;
             if (needUp > 0.45) {
                 up = 0.5;
@@ -1181,20 +1309,30 @@ public class MobPathManager {
                 dz = bestZ;
             }
 
-            mob.setDeltaMovement(dx * push, up, dz * push);
+            boolean headOpen = !isSolid(level, node.above());
+            if (headOpen) {
+                setAssistedVelocity(mob, dx * push, up, dz * push, push);
+            } else {
+                // Hold against the lip while clearing headroom; do not clip into it.
+                setAssistedVelocity(mob, dx * Math.min(push, 0.08),
+                        Math.max(mob.getDeltaMovement().y, 0.05),
+                        dz * Math.min(push, 0.08), 0.08);
+            }
             mob.fallDistance = 0;
 
-            // Inside the open cell now — advance so the next node pulls us through
-            if (needUp > -0.35 && needUp < 0.6 && horiz < 0.8) {
-                cached.advanceNode();
+
+            // If head is still blocked, clear it before advancing into the opening.
+            if (!headOpen && cached != null && cached.maxBreakHardness > 0) {
+                float h = level.getBlockState(node.above()).getDestroySpeed(level, node.above());
+                if (h >= 0 && h <= cached.maxBreakHardness) {
+                    MobBreakerHandler.tickBreaking(mob, node.above(), cached.maxBreakHardness);
+                    headOpen = !isSolid(level, node.above());
+                }
             }
 
-            // If head is still blocked, chip it (soft) so they can crawl in
-            if (cached != null && cached.maxBreakHardness > 0 && isSolid(level, node.above())) {
-                float h = level.getBlockState(node.above()).getDestroySpeed(level, node.above());
-                if (h >= 0 && h <= Math.max(cached.maxBreakHardness, 3.0f)) {
-                    MobBreakerHandler.tickBreaking(mob, node.above(), Math.max(cached.maxBreakHardness, 3.0f));
-                }
+            // Inside a fully open cell now — advance so the next node pulls through.
+            if (headOpen && needUp > -0.35 && needUp < 0.6 && horiz < 0.8) {
+                cached.advanceNode();
             }
 
             if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
@@ -1205,24 +1343,25 @@ public class MobPathManager {
             return;
         }
 
+        // Vanilla navigation owns ordinary movement. Writing MoveControl as well causes
+        // double steering and makes 1.0x look like an external push.
         mob.getNavigation().moveTo(nx, ny, nz, speed);
-        mob.getMoveControl().setWantedPosition(nx, ny, nz, speed);
         mob.getLookControl().setLookAt(nx, ny + 0.5, nz);
 
         // Climb phase: only jump when meaningfully below (avoids lip bounce)
         boolean climbNeeded = needUp > 0.9;
         if (climbNeeded && (mob.onGround() || mob.horizontalCollision)) {
             mob.getJumpControl().jump();
-            double push = 0.26 * Math.min(speed, 1.6);
+            double push = assistedHorizontalSpeed(mob, speed, 0.10, 0.22);
             double up = 0.38;
-            mob.setDeltaMovement(dx * push, Math.max(mob.getDeltaMovement().y, up), dz * push);
+            setAssistedVelocity(mob, dx * push, Math.max(mob.getDeltaMovement().y, up), dz * push, push);
             if (ChallengeMod.isAStarDebugEnabled() && cached != null && mob.tickCount % 20 == 0) {
                 ChallengeMod.LOGGER.debug("[Climb] mob={} → {} needUp={}",
                         mob.getUUID().toString().substring(0, 4), node,
                         String.format("%.1f", needUp));
             }
         } else if (mob.horizontalCollision || (cached != null && cached.stuckTicks > 8)) {
-            double push = 0.28 * Math.min(speed, 1.5);
+            double push = assistedHorizontalSpeed(mob, speed, 0.10, 0.22);
             double ax = 0, az = 0;
             BlockPos feet = mob.blockPosition();
             if (isSolid(level, feet.north())) {
@@ -1254,13 +1393,14 @@ public class MobPathManager {
                 vy = Math.max(vy, 0.28);
                 push = 0.34;
             }
-            mob.setDeltaMovement(dx * push + ax, vy, dz * push + az);
+            setAssistedVelocity(mob, dx * push + ax, vy, dz * push + az, Math.min(0.24, push + 0.06));
         } else if (climbNeeded && !mob.onGround()) {
-            double push = 0.14 * Math.min(speed, 1.5);
-            mob.setDeltaMovement(
+            double push = assistedHorizontalSpeed(mob, speed * 0.65, 0.06, 0.14);
+            setAssistedVelocity(mob,
                     mob.getDeltaMovement().x * 0.55 + dx * push,
                     mob.getDeltaMovement().y,
-                    mob.getDeltaMovement().z * 0.55 + dz * push);
+                    mob.getDeltaMovement().z * 0.55 + dz * push,
+                    0.20);
         }
     }
 
@@ -1314,11 +1454,13 @@ public class MobPathManager {
             dx /= horizontal;
             dz /= horizontal;
         }
-        double pull = horizontal > 0.35 ? 0.22 : 0.05;
+        double pull = horizontal > 0.35
+                ? assistedHorizontalSpeed(mob, ChallengeMod.getSpeedMultiplier(), 0.08, 0.16)
+                : 0.04;
         mob.getNavigation().stop();
         mob.getMoveControl().setWantedPosition(nx, landing.getY(), nz, ChallengeMod.getSpeedMultiplier());
         mob.setNoGravity(false);
-        mob.setDeltaMovement(dx * pull, Math.min(mob.getDeltaMovement().y, -0.35), dz * pull);
+        setAssistedVelocity(mob, dx * pull, Math.min(mob.getDeltaMovement().y, -0.35), dz * pull, pull);
         return true;
     }
 
@@ -1413,6 +1555,9 @@ public class MobPathManager {
         pathCache.remove(mobId);
         pathFailures.remove(mobId);
         mobBreachGen.remove(mobId);
+        freeRouteRetryAfterTick.remove(mobId);
+        // Keep completedSharedRoute across temporary target loss (Creative/Spectator,
+        // range, or brief unload). The route ID itself makes stale entries harmless.
         PathDebugData.removeMobPath(mobId);
         BuildPlanData.removeBuildPlan(mobId);
     }
@@ -1458,6 +1603,7 @@ public class MobPathManager {
 
     public static void onMobRemoved(Mob mob) {
         clearMobState(mob);
+        completedSharedRoute.remove(mob.getUUID());
         MobBuilderHandler.onMobRemoved(mob);
     }
 
@@ -1472,6 +1618,8 @@ public class MobPathManager {
         activeBreachTime.clear();
         openHoles.clear();
         mobBreachGen.clear();
+        freeRouteRetryAfterTick.clear();
+        completedSharedRoute.clear();
         breachGeneration = 0;
         sharedFreeRoute = null;
         lastMetadataCleanupTick = Long.MIN_VALUE;
