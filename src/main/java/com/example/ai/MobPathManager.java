@@ -398,7 +398,6 @@ public class MobPathManager {
     public static class CachedPath {
         public final List<BlockPos> path;
         public final String strategy;
-        public final long timestamp;
         public int currentNodeIndex;
         public final BlockPos targetPos;
         public final Map<BlockPos, BlockPos> buildActions;
@@ -424,13 +423,11 @@ public class MobPathManager {
 
         public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy,
                 boolean partial) {
-            this.path = path;
+            this.path = List.copyOf(path);
             this.strategy = strategy;
-            this.timestamp = System.currentTimeMillis();
             this.currentNodeIndex = 0;
             this.targetPos = targetPos;
             this.buildActions = buildActions != null ? new HashMap<>(buildActions) : new HashMap<>();
-            this.lastCheckTime = timestamp;
             this.partial = partial;
             this.maxBreakHardness = maxBreakHardnessForStrategy(strategy);
         }
@@ -508,10 +505,9 @@ public class MobPathManager {
             lastPos = mobPos;
         }
 
-        public boolean isExpired() {
-            // Paths last longer now (10-14 seconds) to spread load
-            long offset = Math.abs(this.hashCode()) % 4000;
-            return System.currentTimeMillis() - timestamp > (10000 + offset);
+        public boolean isExpired(long currentTick) {
+            long lifetime = partial ? 40 : RECALCULATE_INTERVAL * 2L;
+            return currentTick - lastRecalcTick > lifetime;
         }
 
         public BlockPos getNextNode() {
@@ -591,7 +587,7 @@ public class MobPathManager {
         CachedPath cached = pathCache.get(mob.getUUID());
         BlockPos targetPos = target.blockPosition();
         boolean buildingActive = cached != null && "Building".equals(cached.strategy)
-                && !cached.isExpired() && !cached.isComplete();
+                && !cached.isExpired(currentTick) && !cached.isComplete();
 
         int maxCalcs = currentTick < freeRouteBoostUntilTick
                 ? Math.min(FREE_ROUTE_BOOST_CALCS, MAX_PATH_CALCS_PER_TICK)
@@ -661,7 +657,7 @@ public class MobPathManager {
         // Commit to a path for a while so we don't thrash; stuck/expiry/swarm still force replan.
         // Never lock partials or dig routes when a free path is known (unless already on it).
         boolean pathLocked = cached != null
-                && !cached.isExpired()
+                && !cached.isExpired(currentTick)
                 && !cached.isComplete()
                 && !cached.isStuckLong()
                 && !swarmRepath
@@ -672,11 +668,12 @@ public class MobPathManager {
 
         // On free corridor: only replan if stuck/expired — never dig another wall
         boolean needsRecalculation = !onFreeCorridor && (cached == null
-                || cached.isExpired()
+                || cached.isExpired(currentTick)
                 || cached.isComplete()
                 || cached.isStuckLong()
+                || !isUpcomingPathValid(mob.level(), cached)
                 || swarmRepath);
-        if (onFreeCorridor && cached != null && (cached.isStuckLong() || cached.isExpired() || cached.isComplete())) {
+        if (onFreeCorridor && cached != null && (cached.isStuckLong() || cached.isExpired(currentTick) || cached.isComplete())) {
             needsRecalculation = true;
         }
 
@@ -704,7 +701,7 @@ public class MobPathManager {
         if (!swarmRepath && !stuckReplan && !freeAvailable) {
             if (buildingActive && !shouldReplanBuilding(cached, targetPos)) {
                 needsRecalculation = false;
-            } else if (cached != null && "Building".equals(cached.strategy) && !cached.isExpired()
+            } else if (cached != null && "Building".equals(cached.strategy) && !cached.isExpired(currentTick)
                     && !cached.isComplete() && currentTick < cached.buildLockUntilTick) {
                 BlockPos finalNode = cached.getFinalNode();
                 if (finalNode != null && finalNode.closerThan(targetPos, 5.0)) {
@@ -1084,6 +1081,32 @@ public class MobPathManager {
     private static boolean isSolid(Level level, BlockPos pos) {
         BlockState state = level.getBlockState(pos);
         return state.blocksMotion();
+    }
+
+    /** Validate a small look-ahead window so changed terrain invalidates stale paths cheaply. */
+    private static boolean isUpcomingPathValid(Level level, CachedPath cached) {
+        if (cached == null || cached.isComplete()) {
+            return true;
+        }
+        int end = Math.min(cached.path.size(), cached.currentNodeIndex + 4);
+        for (int i = cached.currentNodeIndex; i < end; i++) {
+            BlockPos node = cached.path.get(i);
+            if (!level.isInWorldBounds(node) || !level.hasChunkAt(node)) {
+                return false;
+            }
+            BlockPos buildTarget = cached.buildActions.get(node);
+            if (buildTarget != null && !level.getBlockState(buildTarget).canBeReplaced()
+                    && !level.getBlockState(buildTarget).blocksMotion()) {
+                return false;
+            }
+            if (isSolid(level, node) && !canStrategyBreak(level, node, cached.maxBreakHardness)) {
+                return false;
+            }
+            if (isSolid(level, node.above()) && !canStrategyBreak(level, node.above(), cached.maxBreakHardness)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static int nearestFreeIndex(BlockPos mobPos, List<BlockPos> path) {

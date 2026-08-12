@@ -26,7 +26,6 @@ public class AStarPathfinder {
 
     /** Absolute cap on expanded nodes per search. */
     private static final int MAX_NODES_HARD = 2800;
-    private static final int MAX_PATH_LENGTH = 120;
 
     /**
      * Ignore reopenings that improve g by less than this (Baritone-style min improvement).
@@ -63,12 +62,14 @@ public class AStarPathfinder {
         public double hCost;
         public PathNode parent;
         public BlockPos buildPos;
+        public int depth;
 
         public PathNode(BlockPos pos) {
             this.pos = pos;
-            this.gCost = Double.MAX_VALUE;
+            this.gCost = Double.POSITIVE_INFINITY;
             this.hCost = 0;
             this.buildPos = null;
+            this.depth = 0;
         }
 
         public double fCost() {
@@ -109,7 +110,7 @@ public class AStarPathfinder {
         }
 
         boolean isStale() {
-            return gCost != node.gCost;
+            return Double.compare(gCost, node.gCost) != 0;
         }
 
         @Override
@@ -195,7 +196,7 @@ public class AStarPathfinder {
         allNodes.put(start, startNode);
 
         PathNode closestNode = startNode;
-        double minHCost = startNode.hCost;
+        double bestPartialScore = partialScore(startNode, startNode.hCost);
         int nodesExplored = 0;
 
         while (!openSet.isEmpty() && nodesExplored < nodeBudget) {
@@ -215,8 +216,9 @@ public class AStarPathfinder {
             nodesExplored++;
             closedSet.add(current.pos);
 
-            if (current.hCost < minHCost) {
-                minHCost = current.hCost;
+            double currentPartialScore = partialScore(current, startNode.hCost);
+            if (current.parent != null && currentPartialScore < bestPartialScore) {
+                bestPartialScore = currentPartialScore;
                 closestNode = current;
             }
 
@@ -295,16 +297,8 @@ public class AStarPathfinder {
                 tryDigDownEdges(current, level, openSet, closedSet, allNodes, target, maxHardness);
             }
 
-            // Pillar up
-            if (allowBuilding) {
-                BlockPos up = current.pos.above();
-                if (isPassable(level, up, allowBreaking, maxHardness)
-                        && isPassable(level, up.above(), allowBreaking, maxHardness)
-                        && !isDanger(level, up)) {
-                    processNeighbor(current, up, level, openSet, closedSet, allNodes, target, true, allowBreaking,
-                            current.pos, maxHardness);
-                }
-            }
+            // Vertical pillaring is intentionally left to MobBuilderHandler. Planning a
+            // block in the mob's occupied feet cell made execution disagree with A*.
 
             // Short jumps (disabled when building so bridges win)
             if (!allowBuilding) {
@@ -320,10 +314,22 @@ public class AStarPathfinder {
             }
         }
 
-        if (closestNode != startNode && !closestNode.pos.equals(start) && closestNode.parent != null) {
+        if (closestNode != startNode && closestNode.parent != null
+                && closestNode.hCost + WALK_COST < startNode.hCost) {
             return reconstructPathResult(closestNode, nodesExplored, false, true);
         }
         return PathResult.notFound(nodesExplored);
+    }
+
+    /**
+     * Rank fallback nodes by remaining distance, travel effort, and useful depth.
+     * This avoids returning an expensive detour that happens to be one heuristic unit closer.
+     */
+    private static double partialScore(PathNode node, double startHeuristic) {
+        double progress = Math.max(0.0, startHeuristic - node.hCost);
+        double effortPenalty = node.gCost * 0.12;
+        double depthReward = Math.min(node.depth, 12) * 0.35;
+        return node.hCost + effortPenalty - progress * 0.2 - depthReward;
     }
 
     /** Scale search budget with distance — short hunts stay cheap. */
@@ -333,32 +339,10 @@ public class AStarPathfinder {
         return Math.min(MAX_NODES_HARD, Math.max(500, budget));
     }
 
-    /**
-     * Goal = same cell or one cardinal step into the player cell (no diagonal false-success).
-     */
+    /** A route succeeds only when it actually reaches the target cell. */
     private static boolean isGoal(Level level, BlockPos current, BlockPos target, boolean allowBreaking,
             float maxHardness) {
-        int dx = Math.abs(current.getX() - target.getX());
-        int dy = Math.abs(current.getY() - target.getY());
-        int dz = Math.abs(current.getZ() - target.getZ());
-        int manhattan = dx + dy + dz;
-        if (manhattan == 0) {
-            return true;
-        }
-        if (manhattan != 1) {
-            return false;
-        }
-        if (isValidMove(level, current, target, allowBreaking, maxHardness)) {
-            return true;
-        }
-        if (allowBreaking && isPassable(level, target, allowBreaking, maxHardness)
-                && isPassable(level, current, allowBreaking, maxHardness)
-                && hasHeadroom(level, current, allowBreaking, maxHardness)
-                && hasHeadroom(level, target, allowBreaking, maxHardness)
-                && !isDanger(level, target)) {
-            return true;
-        }
-        return false;
+        return current.equals(target);
     }
 
     private static PathResult reconstructPathResult(PathNode goal, int nodesExplored, boolean found,
@@ -368,7 +352,7 @@ public class AStarPathfinder {
         PathNode current = goal;
         double cost = goal != null ? goal.gCost : Double.POSITIVE_INFINITY;
 
-        while (current != null && path.size() < MAX_PATH_LENGTH) {
+        while (current != null) {
             path.add(current.pos);
             if (current.buildPos != null) {
                 buildActions.put(current.pos, current.buildPos);
@@ -479,6 +463,7 @@ public class AStarPathfinder {
             neighborNode.gCost = tentativeG;
             neighborNode.hCost = heuristic(neighborPos, target);
             neighborNode.buildPos = buildBlock;
+            neighborNode.depth = current.depth + 1;
             closedSet.remove(neighborPos);
             openSet.add(new OpenEntry(neighborNode));
         }
@@ -506,19 +491,21 @@ public class AStarPathfinder {
     }
 
     /**
-     * Admissible-ish heuristic: never exceeds true cost of pure walking.
-     * Slightly under-weights so search stays goal-directed without over-penalizing dig routes.
+     * Admissible lower bound for the available movement edges. Horizontal and
+     * vertical progress can occur in the same edge, so use the larger bound rather
+     * than adding both and overestimating diagonal climbs/drops.
      */
     private static double heuristic(BlockPos from, BlockPos to) {
         double dx = Math.abs(from.getX() - to.getX());
-        double dy = Math.abs(from.getY() - to.getY());
+        int signedDy = to.getY() - from.getY();
         double dz = Math.abs(from.getZ() - to.getZ());
-        // Octile XY + vertical (matches diagonal walk allowance)
         double minXZ = Math.min(dx, dz);
         double maxXZ = Math.max(dx, dz);
-        double horiz = (maxXZ - minXZ) * WALK_COST + minXZ * DIAGONAL_WALK_COST;
-        double vert = dy * CLIMB_UP_COST * 0.85;
-        return horiz + vert;
+        double horizontal = (maxXZ - minXZ) * WALK_COST + minXZ * DIAGONAL_WALK_COST;
+        double vertical = signedDy >= 0
+                ? signedDy * CLIMB_UP_COST
+                : -signedDy * DROP_PER_BLOCK;
+        return Math.max(horizontal, vertical);
     }
 
     /**
