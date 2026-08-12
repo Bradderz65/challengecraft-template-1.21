@@ -1,16 +1,14 @@
 package com.example.mixin;
 
 import com.example.ChallengeMod;
+import com.example.ai.HuntMovement;
 import com.example.ai.HuntRules;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Mob;
-import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
-import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.monster.AbstractSkeleton;
-import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
@@ -113,7 +111,7 @@ public abstract class MobEntityMixin {
 		if (mob.isInWaterOrBubble()) {
 			speed *= WATER_SPEED_MULTIPLIER;
 		}
-		if (speed > 4.0D && trySnapTowardTarget(mob, target, speed)) {
+		if (speed > 4.0D && HuntMovement.tryFastPursuit(mob, target, speed)) {
 			tryPassiveMelee(mob, target);
 			return;
 		}
@@ -452,49 +450,6 @@ public abstract class MobEntityMixin {
 	}
 
 	@Unique
-	private boolean trySnapTowardTarget(Mob mob, Player target, double speedMultiplier) {
-		Vec3 delta = target.position().subtract(mob.position());
-		double distance = delta.length();
-		if (distance < 0.01D) {
-			return true;
-		}
-		if (distance < 2.0D) {
-			return false;
-		}
-		double stepSize = Math.max(0.05D, Math.min(speedMultiplier * 0.05D, 0.5D));
-		Vec3 step = delta.scale(stepSize / distance);
-		Vec3 nextPos = mob.position().add(step);
-		BlockPos nextBlock = BlockPos.containing(nextPos);
-		if (!mob.level().isLoaded(nextBlock)) {
-			return false;
-		}
-		if (!mob.level().noCollision(mob, mob.getBoundingBox().move(step))) {
-			return false;
-		}
-		// Calculate rotation to face movement
-		double dX = nextPos.x - mob.getX();
-		double dZ = nextPos.z - mob.getZ();
-		if (dX * dX + dZ * dZ > 1.0E-7D) {
-			float targetYRot = (float) (Math.atan2(dZ, dX) * (double) (180F / (float) Math.PI)) - 90.0F;
-
-			// Smooth rotation to prevent jitter
-			float currentYRot = mob.getYRot();
-			float newYRot = currentYRot + net.minecraft.util.Mth.wrapDegrees(targetYRot - currentYRot) * 0.3f; // 30%
-																												// turn
-																												// per
-																												// tick
-
-			float xRot = mob.getXRot();
-			mob.moveTo(nextPos.x, nextPos.y, nextPos.z, newYRot, xRot);
-			mob.setYBodyRot(newYRot);
-			mob.setYHeadRot(newYRot);
-		} else {
-			mob.moveTo(nextPos.x, nextPos.y, nextPos.z, mob.getYRot(), mob.getXRot());
-		}
-		return true;
-	}
-
-	@Unique
 	private void ensureHuntRange(Mob mob) {
 		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
 		if (followRange != null && followRange.getBaseValue() < HuntRules.getHuntRange()) {
@@ -504,7 +459,7 @@ public abstract class MobEntityMixin {
 
 	@Unique
 	private void tryPassiveMelee(Mob mob, Player target) {
-		if (!isPassiveAnimal(mob)) {
+		if (!HuntMovement.isPassiveAnimal(mob)) {
 			return;
 		}
 		if (!HuntRules.isValidPlayerTarget(target)) {
@@ -519,11 +474,6 @@ public abstract class MobEntityMixin {
 		}
 		this.lastPassiveAttackTick = gameTime;
 		target.hurt(mob.damageSources().mobAttack(mob), 2.0F);
-	}
-
-	@Unique
-	private static boolean isPassiveAnimal(Mob mob) {
-		return mob instanceof Animal && !(mob instanceof NeutralMob) && !(mob instanceof Monster);
 	}
 
 }

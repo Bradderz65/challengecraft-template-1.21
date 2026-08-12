@@ -23,7 +23,7 @@ public class MobPathManager {
     }
 
     // Cache paths per mob UUID
-    private static final Map<UUID, CachedPath> pathCache = new ConcurrentHashMap<>();
+    private static final Map<UUID, CachedMobPath> pathCache = new ConcurrentHashMap<>();
 
     // Track when a mob failed to find a path
     private static final Map<UUID, Long> pathFailures = new ConcurrentHashMap<>();
@@ -420,144 +420,6 @@ public class MobPathManager {
     }
 
     /**
-     * Cached path data for a mob
-     */
-    public static class CachedPath {
-        public final List<BlockPos> path;
-        public final String strategy;
-        public int currentNodeIndex;
-        public final BlockPos targetPos;
-        public final Map<BlockPos, BlockPos> buildActions;
-        public int placeDelay = 0;
-
-        public long lastRecalcTick = 0;
-        public long buildLockUntilTick = 0;
-        public long lastBuildTick = 0;
-        public long lastBreakTick = 0;
-        public long lastBuildLogTick = 0;
-        
-        // Stuck detection
-        public BlockPos lastPos = null;
-        public int stuckTicks = 0;
-        public final boolean partial;
-        /** Max block hardness this path may break (Soft 3 / Medium 10 / Hard unlimited). */
-        public final float maxBreakHardness;
-
-        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy) {
-            this(path, targetPos, buildActions, strategy, false);
-        }
-
-        public CachedPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions, String strategy,
-                boolean partial) {
-            this.path = List.copyOf(path);
-            this.strategy = strategy;
-            this.currentNodeIndex = 0;
-            this.targetPos = targetPos;
-            this.buildActions = buildActions != null ? new HashMap<>(buildActions) : new HashMap<>();
-            this.partial = partial;
-            this.maxBreakHardness = maxBreakHardnessForStrategy(strategy);
-        }
-
-        public static float maxBreakHardnessForStrategy(String strategy) {
-            if (strategy == null) {
-                return MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
-            }
-            return switch (strategy) {
-                case "Standard" -> 0.0f; // should not break
-                case "SoftBreak" -> 3.0f;
-                case "MediumBreak" -> 10.0f;
-                case "Building" -> 10.0f; // may soft-clear while bridging
-                case "HardBreak" -> Float.MAX_VALUE;
-                default -> MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
-            };
-        }
-        
-        public void checkStuck(Mob mob, Player target) {
-            BlockPos currentPos = mob.blockPosition();
-            if (lastPos != null && currentPos.equals(lastPos)) {
-                stuckTicks++;
-                if (stuckTicks > 20 && stuckTicks % 100 == 0) { // Log every 5s after being stuck for 1s
-                     if (ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
-                         BlockPos next = getNextNode();
-                         String buildInfo = (next != null && buildActions.containsKey(next)
-                                 ? " (Needs Build at " + buildActions.get(next) + ")" : "");
-                         ChallengeMod.LOGGER.warn("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}", 
-                             mob.getUUID().toString().substring(0, 4), currentPos, stuckTicks, next, buildInfo);
-                     }
-                }
-            } else {
-                stuckTicks = 0;
-                lastPos = currentPos;
-            }
-        }
-
-        public boolean isStuckLong() {
-            return stuckTicks >= STUCK_REPLAN_TICKS;
-        }
-
-        /**
-         * Remaining path nodes from the current index (for debug render).
-         */
-        public List<BlockPos> remainingPath() {
-            if (currentNodeIndex <= 0) {
-                return path;
-            }
-            if (currentNodeIndex >= path.size()) {
-                return Collections.emptyList();
-            }
-            return path.subList(currentNodeIndex, path.size());
-        }
-
-        /**
-         * After a repath, resume near the mob instead of restarting at node 0.
-         */
-        public void snapToNearestNode(Mob mob) {
-            if (path.isEmpty()) {
-                return;
-            }
-            BlockPos mobPos = mob.blockPosition();
-            int best = 0;
-            double bestDist = Double.MAX_VALUE;
-            for (int i = 0; i < path.size(); i++) {
-                double d = path.get(i).distSqr(mobPos);
-                if (d < bestDist) {
-                    bestDist = d;
-                    best = i;
-                }
-            }
-            // Prefer a node slightly ahead so we don't re-arrive at the current cell forever
-            currentNodeIndex = Math.min(best + (bestDist < 2.25 ? 1 : 0), path.size() - 1);
-            stuckTicks = 0;
-            lastPos = mobPos;
-        }
-
-        public boolean isExpired(long currentTick) {
-            long lifetime = partial ? 40 : RECALCULATE_INTERVAL * 2L;
-            return currentTick - lastRecalcTick > lifetime;
-        }
-
-        public BlockPos getNextNode() {
-            if (currentNodeIndex >= path.size()) {
-                return null;
-            }
-            return path.get(currentNodeIndex);
-        }
-        
-        public BlockPos getFinalNode() {
-            if (path.isEmpty()) return null;
-            return path.get(path.size() - 1);
-        }
-
-        public void advanceNode() {
-            currentNodeIndex++;
-        }
-
-        public boolean isComplete() {
-            return currentNodeIndex >= path.size();
-        }
-    }
-
-    /**
      * Update pathfinding for a mob.
      * 
      * @return true if A* pathfinding is active and handling movement
@@ -599,7 +461,7 @@ public class MobPathManager {
             return false;
         }
 
-        CachedPath cached = pathCache.get(mob.getUUID());
+        CachedMobPath cached = pathCache.get(mob.getUUID());
         BlockPos targetPos = target.blockPosition();
         boolean buildingActive = cached != null && "Building".equals(cached.strategy)
                 && !cached.isExpired(currentTick) && !cached.isComplete();
@@ -643,7 +505,7 @@ public class MobPathManager {
             // Partials, dig routes, stuck, swarm, or not near corridor → force onto free path
             // Never run extra A* here — free route adopt is the cheap path for the pack.
             if (!alreadyOnFree || swarmRepath || (cached != null && (cached.partial || !"Standard".equals(cached.strategy)))) {
-                CachedPath adopted = joinFreeRoute(mob, free, targetPos, currentTick, false);
+                CachedMobPath adopted = joinFreeRoute(mob, free, targetPos, currentTick, false);
                 if (adopted != null) {
                     cached = adopted;
                     pathCache.put(mob.getUUID(), cached);
@@ -741,7 +603,7 @@ public class MobPathManager {
                     String strategy;
 
                     if (freeAvailable) {
-                        CachedPath joined = joinFreeRoute(mob, free, targetPos, currentTick, false);
+                        CachedMobPath joined = joinFreeRoute(mob, free, targetPos, currentTick, false);
                         if (joined != null) {
                             result = new AStarPathfinder.PathResult(joined.path, true, false, 0,
                                     Collections.emptyMap(), 0);
@@ -780,8 +642,8 @@ public class MobPathManager {
                     }
 
                     if (result.usable()) {
-                        CachedPath previous = cached;
-                        cached = new CachedPath(result.path, targetPos, result.buildActions, strategy, result.isPartial);
+                        CachedMobPath previous = cached;
+                        cached = new CachedMobPath(result.path, targetPos, result.buildActions, strategy, result.isPartial);
                         cached.lastRecalcTick = currentTick;
                         cached.snapToNearestNode(mob);
                         if ("Building".equals(strategy)) {
@@ -1093,7 +955,7 @@ public class MobPathManager {
     }
 
     /** Validate a small look-ahead window so changed terrain invalidates stale paths cheaply. */
-    private static boolean isUpcomingPathValid(Level level, CachedPath cached) {
+    private static boolean isUpcomingPathValid(Level level, CachedMobPath cached) {
         if (cached == null || cached.isComplete()) {
             return true;
         }
@@ -1148,7 +1010,7 @@ public class MobPathManager {
      * Force this mob onto the proven free corridor to the player.
      * Near: snap onto path. Far: walk to corridor entry (or nearest node), then free path to player.
      */
-    private static CachedPath joinFreeRoute(Mob mob, SharedFreeRoute free, BlockPos targetPos, long currentTick,
+    private static CachedMobPath joinFreeRoute(Mob mob, SharedFreeRoute free, BlockPos targetPos, long currentTick,
             boolean allowAStar) {
         if (free == null || free.path.isEmpty()) {
             return null;
@@ -1236,7 +1098,7 @@ public class MobPathManager {
             combined.addAll(free.path);
         }
 
-        CachedPath adopted = new CachedPath(combined, targetPos, Collections.emptyMap(), "Standard", false);
+        CachedMobPath adopted = new CachedMobPath(combined, targetPos, Collections.emptyMap(), "Standard", false);
         adopted.lastRecalcTick = currentTick;
         adopted.snapToNearestNode(mob);
         adopted.stuckTicks = 0;
@@ -1298,7 +1160,7 @@ public class MobPathManager {
      * Move toward a path node. Handles climb AND vaulting into open wall holes without
      * bounce-spamming at the lip.
      */
-    private static void assistClimbTo(Mob mob, BlockPos node, double speed, CachedPath cached) {
+    private static void assistClimbTo(Mob mob, BlockPos node, double speed, CachedMobPath cached) {
         Level level = mob.level();
         double nx = node.getX() + 0.5;
         double ny = node.getY();
@@ -1513,7 +1375,7 @@ public class MobPathManager {
      * 1) Dig soft cobble (always candidate)
      * 2) Drop through open hatch ONLY if A* can walk from the landing to the player
      */
-    private static boolean tryRoofDropToPlayer(Mob mob, Player target, CachedPath cached, boolean mobGriefing) {
+    private static boolean tryRoofDropToPlayer(Mob mob, Player target, CachedMobPath cached, boolean mobGriefing) {
         if (target.getY() >= mob.getY() - 0.8) {
             return false;
         }
@@ -1821,7 +1683,7 @@ public class MobPathManager {
     /**
      * Dig soft ceiling (cobble) under feet. Independent of Standard maxBreakH=0.
      */
-    private static boolean tryBreakCeilingHatch(Mob mob, Player target, CachedPath cached) {
+    private static boolean tryBreakCeilingHatch(Mob mob, Player target, CachedMobPath cached) {
         if (target.getY() >= mob.getY() - 0.5) {
             return false;
         }
@@ -1867,7 +1729,7 @@ public class MobPathManager {
         return false;
     }
 
-    private static boolean tryBreakSoftCeiling(Mob mob, BlockPos pos, CachedPath cached) {
+    private static boolean tryBreakSoftCeiling(Mob mob, BlockPos pos, CachedMobPath cached) {
         if (!isSolid(mob.level(), pos)) {
             return false;
         }
@@ -1960,7 +1822,7 @@ public class MobPathManager {
         BuildPlanData.removeBuildPlan(mobId);
     }
 
-    private static boolean shouldReplanBuilding(CachedPath cached, BlockPos targetPos) {
+    private static boolean shouldReplanBuilding(CachedMobPath cached, BlockPos targetPos) {
         if (cached == null) {
             return true;
         }
@@ -1972,7 +1834,7 @@ public class MobPathManager {
                 || dy > BUILD_REPLAN_VERTICAL_DISTANCE;
     }
 
-    private static void logBuildPlan(Mob mob, CachedPath cached, String reason) {
+    private static void logBuildPlan(Mob mob, CachedMobPath cached, String reason) {
         if (cached == null) {
             return;
         }
@@ -2023,7 +1885,7 @@ public class MobPathManager {
         lastMetadataCleanupTick = Long.MIN_VALUE;
     }
 
-    public static CachedPath getCachedPath(Mob mob) {
+    public static CachedMobPath getCachedPath(Mob mob) {
         return pathCache.get(mob.getUUID());
     }
 }
