@@ -55,9 +55,8 @@ public class MobPathManager {
     private static int pathCalcsPerTick = 0;
     private static int hatchAstarsThisTick = 0;
     private static long lastTick = 0;
-    private static int activeAStarThisTick = 0;
+    private static long lastMetadataCleanupTick = Long.MIN_VALUE;
 
-    private static final int MAX_ACTIVE_ASTAR_PER_TICK = 12;
     /** Hard cap on full A* plans per server tick (all mobs combined). */
     private static final int MAX_PATH_CALCS_PER_TICK = 3;
     /** Hatch→player verification A* (very expensive if unbounded). */
@@ -74,7 +73,7 @@ public class MobPathManager {
     private static final long FREE_ROUTE_FRESH_MS = 25_000;
 
     // Swarm Intelligence: planned breaches + live break progress (0–1)
-    public static final Map<DimPos, Long> plannedBreaches = new ConcurrentHashMap<>();
+    private static final Map<DimPos, Long> plannedBreaches = new ConcurrentHashMap<>();
     private static final Map<DimPos, Float> activeBreachProgress = new ConcurrentHashMap<>();
     private static final Map<DimPos, Long> activeBreachTime = new ConcurrentHashMap<>();
     private static final long BREACH_EXPIRY_MS = 15000;
@@ -392,6 +391,34 @@ public class MobPathManager {
         return true;
     }
 
+    /** Remove expired global metadata at most once per second of server time. */
+    private static void cleanupExpiredMetadata(long currentTick) {
+        if (lastMetadataCleanupTick != Long.MIN_VALUE && currentTick - lastMetadataCleanupTick < 20) {
+            return;
+        }
+        lastMetadataCleanupTick = currentTick;
+        long now = System.currentTimeMillis();
+
+        plannedBreaches.entrySet().removeIf(entry -> now - entry.getValue() > BREACH_EXPIRY_MS);
+        activeBreachTime.entrySet().removeIf(entry -> {
+            if (now - entry.getValue() <= BREACH_EXPIRY_MS) {
+                return false;
+            }
+            activeBreachProgress.remove(entry.getKey());
+            return true;
+        });
+        openHoles.entrySet().removeIf(entry -> now - entry.getValue() > OPEN_HOLE_EXPIRY_MS);
+        mobPlacedBlocks.entrySet().removeIf(entry -> now - entry.getValue() > MOB_PLACED_BLOCK_EXPIRY_MS);
+        dropReachTime.entrySet().removeIf(entry -> {
+            if (now - entry.getValue() <= DROP_REACH_CACHE_MS) {
+                return false;
+            }
+            dropReachCache.remove(entry.getKey());
+            return true;
+        });
+        pathFailures.entrySet().removeIf(entry -> now - entry.getValue() > 5_000);
+    }
+
     /**
      * Cached path data for a mob
      */
@@ -537,12 +564,7 @@ public class MobPathManager {
      */
     public static boolean updatePathfinding(Mob mob, Player target) {
         if (!ChallengeMod.isAStarEnabled() || target == null || target.isCreative() || target.isSpectator()) {
-            if (pathCache.containsKey(mob.getUUID())) {
-                pathCache.remove(mob.getUUID());
-                clearClientPath(mob);
-                BuildPlanData.removeBuildPlan(mob.getUUID());
-            }
-            pathFailures.remove(mob.getUUID());
+            clearMobState(mob);
             return false;
         }
 
@@ -558,7 +580,7 @@ public class MobPathManager {
             lastTick = currentTick;
             pathCalcsPerTick = 0;
             hatchAstarsThisTick = 0;
-            activeAStarThisTick = 0;
+            cleanupExpiredMetadata(currentTick);
         }
 
         double distance = mob.distanceTo(target);
@@ -566,20 +588,14 @@ public class MobPathManager {
 
         // For very close ranges, don't use A*
         if (distance < 1.5) {
-            pathCache.remove(mob.getUUID());
-            pathFailures.remove(mob.getUUID());
-            clearClientPath(mob);
-            BuildPlanData.removeBuildPlan(mob.getUUID());
+            clearMobState(mob);
             return false;
         }
 
         // For very long ranges, don't use A*
         if (distance > MAX_ASTAR_DISTANCE
                 && horizontalDistSqr > (MAX_ASTAR_HORIZONTAL_DISTANCE * MAX_ASTAR_HORIZONTAL_DISTANCE)) {
-            pathCache.remove(mob.getUUID());
-            pathFailures.remove(mob.getUUID());
-            clearClientPath(mob);
-            BuildPlanData.removeBuildPlan(mob.getUUID());
+            clearMobState(mob);
             return false;
         }
 
@@ -593,11 +609,7 @@ public class MobPathManager {
                 : MAX_PATH_CALCS_PER_TICK;
         // Low TPS / slot limit: still FOLLOW existing paths (and dig roof), just don't replan
         boolean allowNewPathCalc = ChallengeMod.getCurrentTps() >= TPS_CUTOFF
-                && activeAStarThisTick < MAX_ACTIVE_ASTAR_PER_TICK
                 && pathCalcsPerTick < maxCalcs;
-        if (allowNewPathCalc) {
-            activeAStarThisTick++;
-        }
 
         // Swarm / free-route generation → unlock so the pack funnels through open paths
         long seenGen = mobBreachGen.getOrDefault(mob.getUUID(), -1L);
@@ -1939,6 +1951,15 @@ public class MobPathManager {
         PathDebugData.removeMobPath(mob.getUUID());
     }
 
+    private static void clearMobState(Mob mob) {
+        UUID mobId = mob.getUUID();
+        pathCache.remove(mobId);
+        pathFailures.remove(mobId);
+        mobBreachGen.remove(mobId);
+        PathDebugData.removeMobPath(mobId);
+        BuildPlanData.removeBuildPlan(mobId);
+    }
+
     private static boolean shouldReplanBuilding(CachedPath cached, BlockPos targetPos) {
         if (cached == null) {
             return true;
@@ -1979,9 +2000,7 @@ public class MobPathManager {
     }
 
     public static void onMobRemoved(Mob mob) {
-        pathCache.remove(mob.getUUID());
-        pathFailures.remove(mob.getUUID());
-        PathDebugData.removeMobPath(mob.getUUID());
+        clearMobState(mob);
         MobBuilderHandler.onMobRemoved(mob);
     }
 
@@ -2001,6 +2020,7 @@ public class MobPathManager {
         breachGeneration = 0;
         sharedFreeRoute = null;
         freeRouteBoostUntilTick = 0;
+        lastMetadataCleanupTick = Long.MIN_VALUE;
     }
 
     public static CachedPath getCachedPath(Mob mob) {
