@@ -6,6 +6,7 @@ import net.fabricmc.api.ModInitializer;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -153,6 +154,12 @@ public class ChallengeMod implements ModInitializer {
 
 		// Register anti-tower handler
 		AntiTowerHandler.register();
+
+		ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
+			if (entity instanceof net.minecraft.world.entity.Mob mob) {
+				com.example.ai.MobPathManager.onMobRemoved(mob);
+			}
+		});
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
 			dispatcher.register(Commands.literal("fasttarget")
