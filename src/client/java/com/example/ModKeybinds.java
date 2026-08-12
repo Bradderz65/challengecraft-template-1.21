@@ -1,6 +1,6 @@
 package com.example;
 
-import com.example.screen.ModConfigScreen;
+import com.example.screen.OrganizedConfigScreen;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.client.KeyMapping;
@@ -38,6 +38,6 @@ public class ModKeybinds {
      * Open the mod configuration screen.
      */
     public static void openConfigScreen(Minecraft client) {
-        client.setScreen(new ModConfigScreen(null));
+        client.setScreen(new OrganizedConfigScreen(null));
     }
 }

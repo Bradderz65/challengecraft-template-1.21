@@ -1,6 +1,7 @@
 package com.example;
 
 import com.example.config.ModConfig;
+import com.example.network.ClientConfigNetworking;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -30,7 +31,8 @@ public class ChallengeModClient implements ClientModInitializer {
 		// Load config from file
 		ModConfig.load();
 
-		// Register keybinds
+		// Register server config synchronization and keybinds
+		ClientConfigNetworking.register();
 		ModKeybinds.register();
 
 		// Register debug renderers

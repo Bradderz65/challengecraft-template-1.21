@@ -2,6 +2,7 @@ package com.example;
 
 import com.example.antitower.AntiTowerHandler;
 import com.example.config.ModConfig;
+import com.example.network.ConfigNetworking;
 import net.fabricmc.api.ModInitializer;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
@@ -152,7 +153,8 @@ public class ChallengeMod implements ModInitializer {
 		// Load config for dedicated server and singleplayer
 		ModConfig.load();
 
-		// Register anti-tower handler
+		// Register authoritative multiplayer configuration and anti-tower behavior
+		ConfigNetworking.register();
 		AntiTowerHandler.register();
 
 		ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
