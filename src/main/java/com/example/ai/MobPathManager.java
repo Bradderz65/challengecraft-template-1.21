@@ -412,7 +412,6 @@ public class MobPathManager {
         // Stuck detection
         public BlockPos lastPos = null;
         public int stuckTicks = 0;
-        public long lastCheckTime = 0;
         public final boolean partial;
         /** Max block hardness this path may break (Soft 3 / Medium 10 / Hard unlimited). */
         public final float maxBreakHardness;
@@ -839,9 +838,7 @@ public class MobPathManager {
                 }
             }
 
-            if (cached != null) {
-                cached.lastCheckTime = System.currentTimeMillis();
-            } else {
+            if (cached == null) {
                 pathFailures.put(mob.getUUID(), System.currentTimeMillis());
                 return false;
             }
@@ -970,7 +967,7 @@ public class MobPathManager {
                         BlockPos under = mob.blockPosition().below();
                         if (!isSolid(mob.level(), under)) {
                             if (hatchReachesPlayer(mob, target, under)) {
-                                forceDropToward(mob, under, nextNode);
+                                forceDropThroughHatch(mob, under);
                                 return true;
                             }
                             // Open air but no path to player from below — do not false-drop
@@ -1057,7 +1054,7 @@ public class MobPathManager {
                     if (nextNode.getY() < mob.getY() - 0.2) {
                         if (hatchReachesPlayer(mob, target, nextNode)
                                 || (cached.path != null && pathEndsNearPlayer(cached.path, target.blockPosition()))) {
-                            forceDropToward(mob, nextNode, nextNode);
+                            forceDropThroughHatch(mob, nextNode);
                             return true;
                         }
                         // Fall through to normal move — may replan instead of false-drop
@@ -1450,13 +1447,6 @@ public class MobPathManager {
     }
 
     /**
-     * Center on the hatch XZ and fall down the shaft (do NOT aim at player XZ on the roof).
-     */
-    private static void forceDropToward(Mob mob, BlockPos hatchCell, BlockPos ignoredAim) {
-        forceDropThroughHatch(mob, hatchCell);
-    }
-
-    /**
      * Drop through an open hatch: stay centered on the hole and apply strong downward motion.
      */
     private static void forceDropThroughHatch(Mob mob, BlockPos hatchOpenCell) {
@@ -1794,31 +1784,6 @@ public class MobPathManager {
         return null;
     }
 
-    /**
-     * True if following this path would require breaking ultra-hard blocks
-     * (obsidian / netherite tier, hardness ≥ 20).
-     */
-    private static boolean pathRequiresUltraHardBreak(Level level, List<BlockPos> path) {
-        if (path == null) {
-            return false;
-        }
-        for (BlockPos node : path) {
-            if (isUltraHard(level, node) || isUltraHard(level, node.above())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isUltraHard(Level level, BlockPos pos) {
-        BlockState state = level.getBlockState(pos);
-        if (!state.blocksMotion()) {
-            return false;
-        }
-        float hardness = state.getDestroySpeed(level, pos);
-        return hardness >= MobBreakerHandler.ULTRA_HARD_THRESHOLD;
-    }
-
     private static boolean canStrategyBreak(Level level, BlockPos pos, float maxHardness) {
         BlockState state = level.getBlockState(pos);
         if (!state.blocksMotion()) {
@@ -1842,51 +1807,6 @@ public class MobPathManager {
     }
 
     /**
-     * Candidate path with a comparable "effort" score (lower = better).
-     */
-    private static final class ScoredPath {
-        final AStarPathfinder.PathResult result;
-        final String strategy; // null = classify from path contents
-        final double score;
-
-        ScoredPath(AStarPathfinder.PathResult result, String strategy, double score) {
-            this.result = result;
-            this.strategy = strategy;
-            this.score = score;
-        }
-    }
-
-    /**
-     * Score a path for selection. Full paths beat partials. Among equals, lower A* cost wins.
-     * Partials / intermediate soft-breach goals always add remaining distance to the player.
-     */
-    private static ScoredPath scoreCandidate(String strategyLabel, AStarPathfinder.PathResult result,
-            BlockPos targetPos, boolean intermediateToPlayer) {
-        if (result == null || !result.usable()) {
-            return new ScoredPath(AStarPathfinder.PathResult.notFound(0), strategyLabel, Double.POSITIVE_INFINITY);
-        }
-        double score = result.pathCost;
-        BlockPos end = result.path.get(result.path.size() - 1);
-        double remainToPlayer = Math.sqrt(end.distToCenterSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5,
-                targetPos.getZ() + 0.5));
-
-        // Soft-breach paths only reach the hatch — never treat as full player arrival
-        if (intermediateToPlayer) {
-            score += 25.0 + remainToPlayer * 10.0;
-            if (pathMaxY(result.path) > targetPos.getY()) {
-                score -= 20.0; // climbed toward a roof hatch — good intermediate
-            }
-        } else if (!result.found) {
-            score += 40.0 + remainToPlayer * 12.0;
-        }
-        // Slight preference for not building when costs are close
-        if (result.buildActions != null && !result.buildActions.isEmpty()) {
-            score += 8.0;
-        }
-        return new ScoredPath(result, strategyLabel, score);
-    }
-
-    /**
      * Dig soft ceiling (cobble) under feet. Independent of Standard maxBreakH=0.
      */
     private static boolean tryBreakCeilingHatch(Mob mob, Player target, CachedPath cached) {
@@ -1903,7 +1823,7 @@ public class MobPathManager {
             // Keep walking toward last dig so we don't freeze beside the hole
             BlockPos feet = mob.blockPosition();
             if (!isSolid(mob.level(), feet.below())) {
-                forceDropToward(mob, feet.below(), feet.below());
+                forceDropThroughHatch(mob, feet.below());
                 return true;
             }
             mob.getNavigation().stop();
@@ -1953,19 +1873,6 @@ public class MobPathManager {
         mob.getMoveControl().setWantedPosition(pos.getX() + 0.5, mob.getY(), pos.getZ() + 0.5,
                 ChallengeMod.getSpeedMultiplier());
         return true;
-    }
-
-    private static ScoredPath pickCheapest(List<ScoredPath> candidates) {
-        ScoredPath best = null;
-        for (ScoredPath c : candidates) {
-            if (c == null || c.result == null || !c.result.usable()) {
-                continue;
-            }
-            if (best == null || c.score < best.score) {
-                best = c;
-            }
-        }
-        return best;
     }
 
     /**
@@ -2024,83 +1931,12 @@ public class MobPathManager {
         return h < 0 ? 0f : h;
     }
 
-    /**
-     * Find a soft (hardness ≤ maxH) solid near the player — roof hatches, cobble doors, dirt plugs.
-     * Prefers blocks above the player (roof) and closer to the mob.
-     */
-    private static BlockPos findBestSoftBreach(Level level, BlockPos playerPos, BlockPos mobPos, float maxH) {
-        BlockPos best = null;
-        double bestScore = Double.MAX_VALUE;
-        int radius = 5;
-        for (int dy = -1; dy <= 5; dy++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (dx * dx + dy * dy + dz * dz > radius * radius + 8) {
-                        continue;
-                    }
-                    BlockPos p = playerPos.offset(dx, dy, dz);
-                    if (!level.isInWorldBounds(p) || !level.hasChunkAt(p)) {
-                        continue;
-                    }
-                    BlockState state = level.getBlockState(p);
-                    if (!state.blocksMotion()) {
-                        continue;
-                    }
-                    float hardness = state.getDestroySpeed(level, p);
-                    if (hardness < 0 || hardness > maxH) {
-                        continue;
-                    }
-                    // Prefer roof (above player), then closer to mob, slightly prefer lower hardness
-                    double score = mobPos.distSqr(p) + hardness * 8.0;
-                    if (dy > 0) {
-                        score -= 80.0 * dy; // strong bias to roof weak points
-                    } else if (dy < 0) {
-                        score += 40.0;
-                    }
-                    if (score < bestScore) {
-                        bestScore = score;
-                        best = p.immutable();
-                    }
-                }
-            }
-        }
-        return best;
-    }
-
     private static void syncPathToClients(Mob mob, List<BlockPos> path) {
         PathDebugData.setMobPath(mob.getUUID(), path);
     }
 
     private static void clearClientPath(Mob mob) {
         PathDebugData.removeMobPath(mob.getUUID());
-    }
-
-    private static boolean isCloserPartial(AStarPathfinder.PathResult candidate, AStarPathfinder.PathResult current,
-            BlockPos targetPos) {
-        if (candidate == null || candidate.path == null || candidate.path.isEmpty()) {
-            return false;
-        }
-        // A full path always beats a partial / empty result
-        if (candidate.found && (current == null || !current.found)) {
-            return true;
-        }
-        if (current == null || current.path == null || current.path.isEmpty()) {
-            return true;
-        }
-        // Prefer full over partial when both have paths
-        if (candidate.found && current.isPartial) {
-            return true;
-        }
-        if (candidate.isPartial && current.found) {
-            return false;
-        }
-        BlockPos candidateEnd = candidate.path.get(candidate.path.size() - 1);
-        BlockPos currentEnd = current.path.get(current.path.size() - 1);
-        double candidateDist = candidateEnd.distToCenterSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5,
-                targetPos.getZ() + 0.5);
-        double currentDist = currentEnd.distToCenterSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5,
-                targetPos.getZ() + 0.5);
-        return candidateDist < currentDist;
     }
 
     private static boolean shouldReplanBuilding(CachedPath cached, BlockPos targetPos) {

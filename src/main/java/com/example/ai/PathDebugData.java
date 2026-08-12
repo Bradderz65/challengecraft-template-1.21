@@ -34,15 +34,6 @@ public class PathDebugData {
     }
 
     /**
-     * Refresh expiry without changing the stored path.
-     */
-    public static void touchMobPath(UUID mobId) {
-        if (mobPaths.containsKey(mobId)) {
-            pathTimestamps.put(mobId, System.currentTimeMillis());
-        }
-    }
-
-    /**
      * Get the path for a mob
      */
     public static List<BlockPos> getMobPath(UUID mobId) {

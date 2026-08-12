@@ -34,15 +34,6 @@ public class BuildPlanData {
     }
 
     /**
-     * Refresh expiry without changing the stored plan.
-     */
-    public static void touchBuildPlan(UUID mobId) {
-        if (mobBuildPlans.containsKey(mobId)) {
-            planTimestamps.put(mobId, System.currentTimeMillis());
-        }
-    }
-
-    /**
      * Get the build plan for a mob
      */
     public static List<BlockPos> getBuildPlan(UUID mobId) {

@@ -22,9 +22,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Mob.class)
 public abstract class MobEntityMixin {
 	@Unique
-	private long lastDebugTick;
-
-	@Unique
 	private long lastPassiveAttackTick;
 
 	@Unique
@@ -43,7 +40,6 @@ public abstract class MobEntityMixin {
 	private void challengemod$registerFollowRange(CallbackInfo info) {
 		Mob mob = (Mob) (Object) this;
 		boolean eligible = HuntRules.isEligibleMob(mob);
-		// registerGoals log removed
 		if (!eligible) {
 			return;
 		}
@@ -98,7 +94,6 @@ public abstract class MobEntityMixin {
 			if (mob.getTarget() instanceof Player) {
 				mob.setTarget(null);
 			}
-			// debugLog(mob, "aiStep target=none");
 			return;
 		}
 
@@ -120,8 +115,6 @@ public abstract class MobEntityMixin {
 		}
 		if (speed > 4.0D && trySnapTowardTarget(mob, target, speed)) {
 			tryPassiveMelee(mob, target);
-			// debugLog(mob, "aiStep target=" + target.getName().getString() + "
-			// snap=true");
 			return;
 		}
 
@@ -456,7 +449,6 @@ public abstract class MobEntityMixin {
 			}
 		}
 
-		// debugLog(mob, "aiStep target=" + target.getName().getString());
 	}
 
 	@Unique
@@ -534,13 +526,4 @@ public abstract class MobEntityMixin {
 		return mob instanceof Animal && !(mob instanceof NeutralMob) && !(mob instanceof Monster);
 	}
 
-	@Unique
-	private void debugLog(Mob mob, String message) {
-		long gameTime = mob.level().getGameTime();
-		if (gameTime - this.lastDebugTick < 100L) {
-			return;
-		}
-		this.lastDebugTick = gameTime;
-		ChallengeMod.LOGGER.info("[HuntDebug] {} {}", mob.getType().toShortString(), message);
-	}
 }

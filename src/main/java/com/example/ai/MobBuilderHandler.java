@@ -178,7 +178,6 @@ public class MobBuilderHandler {
         if (state.isComplete()) {
             buildingStates.remove(mobId);
             BuildPlanData.removeBuildPlan(mobId);
-            markBuildComplete(mob); // Start cooldown to prevent immediate re-building
             return false;
         }
 
@@ -276,13 +275,6 @@ public class MobBuilderHandler {
     }
 
     /**
-     * Get the current build state for a mob
-     */
-    public static BuildingState getBuildingState(Mob mob) {
-        return buildingStates.get(mob.getUUID());
-    }
-
-    /**
      * Clean up when a mob is removed
      */
     public static void onMobRemoved(Mob mob) {
@@ -295,13 +287,8 @@ public class MobBuilderHandler {
      */
     public static void clearAll() {
         buildingStates.clear();
-        buildCooldowns.clear();
         BuildPlanData.clearAll();
     }
-
-    // Cooldown tracking - prevent immediate re-building after completion
-    private static final Map<UUID, Long> buildCooldowns = new ConcurrentHashMap<>();
-    private static final long BUILD_COOLDOWN_MS = 5000; // 5 seconds before can build again
 
     /**
      * Cancel building for a mob (used when path is found)
@@ -311,20 +298,4 @@ public class MobBuilderHandler {
         BuildPlanData.removeBuildPlan(mob.getUUID());
     }
 
-    /**
-     * Check if mob recently completed a build (to prevent immediate re-building)
-     */
-    public static boolean recentlyBuilt(Mob mob) {
-        Long lastBuild = buildCooldowns.get(mob.getUUID());
-        if (lastBuild == null)
-            return false;
-        return System.currentTimeMillis() - lastBuild < BUILD_COOLDOWN_MS;
-    }
-
-    /**
-     * Mark that a mob just finished building
-     */
-    private static void markBuildComplete(Mob mob) {
-        buildCooldowns.put(mob.getUUID(), System.currentTimeMillis());
-    }
 }

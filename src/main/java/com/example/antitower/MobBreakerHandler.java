@@ -14,8 +14,6 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.level.ClipContext;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -214,16 +212,6 @@ public class MobBreakerHandler {
             }
         }
         return best;
-    }
-
-    public static List<BlockPos> getDamagedBlocks(Level level) {
-        List<BlockPos> damaged = new ArrayList<>();
-        for (DimPos key : blockDamage.keySet()) {
-            if (key.dimension().equals(level.dimension())) {
-                damaged.add(key.pos());
-            }
-        }
-        return damaged;
     }
 
     public static void clearAll() {
