@@ -46,7 +46,8 @@ public class PathDebugData {
      * Get the path for a mob
      */
     public static List<BlockPos> getMobPath(UUID mobId) {
-        return mobPaths.get(mobId);
+        List<BlockPos> path = mobPaths.get(mobId);
+        return path == null ? null : List.copyOf(path);
     }
 
     /**

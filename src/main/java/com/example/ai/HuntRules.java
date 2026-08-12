@@ -73,13 +73,14 @@ public final class HuntRules {
 
 	public static Player findClosestTarget(Mob mob) {
 		Player closest = null;
-		double closestDistance = getHuntRangeSquared();
+		double huntRangeSquared = getHuntRangeSquared();
+		double closestDistance = huntRangeSquared;
 		for (Player player : mob.level().players()) {
 			if (!isValidPlayerTarget(player)) {
 				continue;
 			}
 			double distance = mob.distanceToSqr(player);
-			if (distance <= getHuntRangeSquared() && distance < closestDistance) {
+			if (distance <= huntRangeSquared && distance < closestDistance) {
 				closest = player;
 				closestDistance = distance;
 			}

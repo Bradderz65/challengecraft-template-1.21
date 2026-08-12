@@ -1,6 +1,5 @@
 package com.example.mixin;
 
-import com.example.ChallengeMod;
 import com.example.antitower.AntiTowerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerPlayer;
@@ -45,9 +44,6 @@ public abstract class BlockItemMixin {
         if (context.getLevel().getBlockState(context.getClickedPos()).canBeReplaced(context)) {
             placedPos = context.getClickedPos();
         }
-
-        ChallengeMod.LOGGER.info("[AntiTower] Block placed by {} at {}",
-                serverPlayer.getName().getString(), placedPos);
 
         AntiTowerHandler.onBlockPlaced(serverPlayer, placedPos);
     }

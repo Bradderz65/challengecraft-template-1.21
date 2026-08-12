@@ -590,7 +590,7 @@ public class AStarPathfinder {
 
         // Live progress from the swarm (0 = untouched, 1 = about to pop)
         float progress = Math.max(
-                MobBreakerHandler.getBlockDamage(pos),
+                MobBreakerHandler.getBlockDamage(level, pos),
                 MobPathManager.getBreachProgress(level, pos));
 
         // Base dig ticks ≈ inverse of MobBreakerHandler damage per hit

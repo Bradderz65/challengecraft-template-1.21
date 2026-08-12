@@ -46,7 +46,8 @@ public class BuildPlanData {
      * Get the build plan for a mob
      */
     public static List<BlockPos> getBuildPlan(UUID mobId) {
-        return mobBuildPlans.get(mobId);
+        List<BlockPos> plan = mobBuildPlans.get(mobId);
+        return plan == null ? null : List.copyOf(plan);
     }
 
     /**

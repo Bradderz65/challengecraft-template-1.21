@@ -346,14 +346,14 @@ public class MobPathManager {
         DimPos key = new DimPos(level.dimension(), pos);
         Long t = activeBreachTime.get(key);
         if (t == null) {
-            return MobBreakerHandler.getBlockDamage(pos);
+            return MobBreakerHandler.getBlockDamage(level, pos);
         }
         if (System.currentTimeMillis() - t > BREACH_EXPIRY_MS) {
             activeBreachProgress.remove(key);
             activeBreachTime.remove(key);
-            return MobBreakerHandler.getBlockDamage(pos);
+            return MobBreakerHandler.getBlockDamage(level, pos);
         }
-        return Math.max(activeBreachProgress.getOrDefault(key, 0f), MobBreakerHandler.getBlockDamage(pos));
+        return Math.max(activeBreachProgress.getOrDefault(key, 0f), MobBreakerHandler.getBlockDamage(level, pos));
     }
 
     public static void registerMobPlacedBlock(Level level, BlockPos pos) {
@@ -933,8 +933,8 @@ public class MobPathManager {
 
                 if (nextNode != null) {
                     // Swarm focus: nearly-broken solid only (don't freeze on air / finished digs)
-                    BlockPos swarmHole = MobBreakerHandler.findBestSwarmBreach(mob.blockPosition(), 10);
-                    float swarmDmg = swarmHole != null ? MobBreakerHandler.getBlockDamage(swarmHole) : 0f;
+                    BlockPos swarmHole = MobBreakerHandler.findBestSwarmBreach(mob.level(), mob.blockPosition(), 10);
+                    float swarmDmg = swarmHole != null ? MobBreakerHandler.getBlockDamage(mob.level(), swarmHole) : 0f;
                     if (swarmHole != null && isSolid(mob.level(), swarmHole)
                             && swarmDmg >= MobBreakerHandler.SWARM_FOCUS_DAMAGE
                             && mob.blockPosition().closerThan(swarmHole, 4.5)) {
@@ -951,7 +951,7 @@ public class MobPathManager {
                                     ChallengeMod.LOGGER.info(
                                             "[SwarmDig] mob={} focus {} dmg={}",
                                             mob.getUUID().toString().substring(0, 4), swarmHole,
-                                            String.format("%.2f", MobBreakerHandler.getBlockDamage(swarmHole)));
+                                            String.format("%.2f", MobBreakerHandler.getBlockDamage(mob.level(), swarmHole)));
                                 }
                             }
                             mob.getLookControl().setLookAt(swarmHole.getX() + 0.5, swarmHole.getY() + 0.5,

@@ -2,10 +2,12 @@ package com.example.antitower;
 
 import com.example.ai.MobPathManager;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -18,8 +20,11 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class MobBreakerHandler {
-    // Map of BlockPos -> Breaking Progress (0.0f to 1.0f)
-    private static final Map<BlockPos, Float> blockDamage = new ConcurrentHashMap<>();
+    private record DimPos(ResourceKey<Level> dimension, BlockPos pos) {
+    }
+
+    // Breaking progress is dimension-aware because identical coordinates can exist in every level.
+    private static final Map<DimPos, Float> blockDamage = new ConcurrentHashMap<>();
 
     /** Obsidian / netherite-tier hardness. */
     public static final float ULTRA_HARD_THRESHOLD = 20.0f;
@@ -63,11 +68,11 @@ public class MobBreakerHandler {
             return;
 
         // Prefer finishing a nearly broken breach over random LOS digs
-        BlockPos focus = findBestSwarmBreach(mob.blockPosition(), 12);
+        BlockPos focus = findBestSwarmBreach(mob.level(), mob.blockPosition(), 12);
         if (focus != null && mob.blockPosition().closerThan(focus, 4.0)) {
             // Extra chip on swarm holes so packs open faster
             tickBreaking(mob, focus, maxHardness);
-            if (getBlockDamage(focus) >= SWARM_FOCUS_DAMAGE) {
+            if (getBlockDamage(mob.level(), focus) >= SWARM_FOCUS_DAMAGE) {
                 tickBreaking(mob, focus, maxHardness);
             }
             return;
@@ -112,7 +117,7 @@ public class MobBreakerHandler {
             return false;
         BlockState state = mob.level().getBlockState(pos);
         if (state.isAir()) {
-            blockDamage.remove(pos);
+            blockDamage.remove(new DimPos(mob.level().dimension(), pos));
             return true;
         }
 
@@ -135,7 +140,8 @@ public class MobBreakerHandler {
         // Keep in sync with estimateTicksToBreak().
         float damageAmount = hardness <= 3.0f ? (0.12f / Math.max(hardness, 0.2f)) : (0.05f / hardness);
         // Extra 25% when already swarm-focused (multiple diggers finishing one hole)
-        float existing = blockDamage.getOrDefault(pos.immutable(), 0f);
+        DimPos key = new DimPos(level.dimension(), pos.immutable());
+        float existing = blockDamage.getOrDefault(key, 0f);
         if (existing >= SWARM_FOCUS_DAMAGE) {
             damageAmount *= 1.25f;
         }
@@ -146,52 +152,53 @@ public class MobBreakerHandler {
             float amount) {
         if (!level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
             return;
-        BlockPos key = pos.immutable();
+        BlockPos blockPos = pos.immutable();
+        DimPos key = new DimPos(level.dimension(), blockPos);
         float currentDamage = blockDamage.getOrDefault(key, 0f);
-        currentDamage += amount;
-
-        if (currentDamage > 1.0f)
-            currentDamage = 1.0f;
+        currentDamage = Math.min(1.0f, currentDamage + amount);
         blockDamage.put(key, currentDamage);
 
         // Swarm magnet: publish breach so A* routes everyone through this hole
-        MobPathManager.registerActiveBreach(level, key, currentDamage);
+        MobPathManager.registerActiveBreach(level, blockPos, currentDamage);
 
         int progressStage = (int) (currentDamage * 9);
-        int breakId = key.hashCode();
+        int breakId = 31 * level.dimension().hashCode() + blockPos.hashCode();
 
         if (currentDamage >= 1.0f) {
-            level.destroyBlock(key, true, breaker);
+            level.destroyBlock(blockPos, true, breaker);
             blockDamage.remove(key);
-            level.destroyBlockProgress(breakId, key, -1);
+            level.destroyBlockProgress(breakId, blockPos, -1);
             // Funnel only if near a player (open hole that can lead to the hunt target)
-            if (level.getNearestPlayer(key.getX() + 0.5, key.getY() + 0.5, key.getZ() + 0.5, 36.0, false) != null) {
-                MobPathManager.registerOpenHole(level, key);
+            if (level.getNearestPlayer(blockPos.getX() + 0.5, blockPos.getY() + 0.5, blockPos.getZ() + 0.5, 36.0, false) != null) {
+                MobPathManager.registerOpenHole(level, blockPos);
             } else {
-                MobPathManager.clearBreach(level, key);
+                MobPathManager.clearBreach(level, blockPos);
             }
         } else {
-            level.destroyBlockProgress(breakId, key, progressStage);
+            level.destroyBlockProgress(breakId, blockPos, progressStage);
         }
     }
 
-    public static float getBlockDamage(BlockPos pos) {
-        return blockDamage.getOrDefault(pos, 0f);
+    public static float getBlockDamage(Level level, BlockPos pos) {
+        return blockDamage.getOrDefault(new DimPos(level.dimension(), pos), 0f);
     }
 
     /**
      * Highest-progress damaged solid within range (for swarm focus).
      */
-    public static BlockPos findBestSwarmBreach(BlockPos near, int range) {
+    public static BlockPos findBestSwarmBreach(Level level, BlockPos near, int range) {
         BlockPos best = null;
         float bestScore = SWARM_FOCUS_DAMAGE; // minimum to consider
         int r2 = range * range;
-        for (Map.Entry<BlockPos, Float> e : blockDamage.entrySet()) {
+        for (Map.Entry<DimPos, Float> e : blockDamage.entrySet()) {
+            if (!e.getKey().dimension().equals(level.dimension())) {
+                continue;
+            }
             float dmg = e.getValue();
             if (dmg < SWARM_FOCUS_DAMAGE) {
                 continue;
             }
-            BlockPos p = e.getKey();
+            BlockPos p = e.getKey().pos();
             int dx = p.getX() - near.getX();
             int dy = p.getY() - near.getY();
             int dz = p.getZ() - near.getZ();
@@ -209,8 +216,14 @@ public class MobBreakerHandler {
         return best;
     }
 
-    public static List<BlockPos> getDamagedBlocks() {
-        return new ArrayList<>(blockDamage.keySet());
+    public static List<BlockPos> getDamagedBlocks(Level level) {
+        List<BlockPos> damaged = new ArrayList<>();
+        for (DimPos key : blockDamage.keySet()) {
+            if (key.dimension().equals(level.dimension())) {
+                damaged.add(key.pos());
+            }
+        }
+        return damaged;
     }
 
     public static void clearAll() {
