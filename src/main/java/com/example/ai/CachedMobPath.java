@@ -15,7 +15,7 @@ import java.util.Map;
 public final class CachedMobPath {
     private static final int STUCK_REPLAN_TICKS = 60;
     private static final int FULL_PATH_LIFETIME_TICKS = 200;
-    private static final int PARTIAL_PATH_LIFETIME_TICKS = 40;
+    private static final int PARTIAL_PATH_LIFETIME_TICKS = 100;
 
     public final List<BlockPos> path;
     public final String strategy;

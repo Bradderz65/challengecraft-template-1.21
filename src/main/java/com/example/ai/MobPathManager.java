@@ -57,12 +57,12 @@ public class MobPathManager {
     private static long lastTick = 0;
     private static long lastMetadataCleanupTick = Long.MIN_VALUE;
 
-    /** Hard cap on full A* plans per server tick (all mobs combined). */
-    private static final int MAX_PATH_CALCS_PER_TICK = 3;
-    /** Hatch→player verification A* (very expensive if unbounded). */
-    private static final int MAX_HATCH_ASTAR_PER_TICK = 2;
-    /** Brief boost when a free route opens — keep small to avoid lag spikes. */
-    private static final int FREE_ROUTE_BOOST_CALCS = 4;
+    /** Hard cap on all A* plans per server tick. Cached paths continue moving meanwhile. */
+    private static final int MAX_PATH_CALCS_PER_TICK = 1;
+    /** Hatch verification shares the same global A* budget. */
+    private static final int MAX_HATCH_ASTAR_PER_TICK = 1;
+    /** Never increase same-tick work when a route opens; prioritize through generations instead. */
+    private static final int FREE_ROUTE_BOOST_CALCS = 1;
     private static final int FREE_ROUTE_BOOST_TICKS = 30; // 1.5s
     private static final double TPS_CUTOFF = 18.0;
 
@@ -198,14 +198,14 @@ public class MobPathManager {
             }
         }
 
-        // Rate-limit pack repath: at most once per 500ms
+        // Batch nearby block changes so one dig does not make the whole pack replan repeatedly.
         long now = System.currentTimeMillis();
-        if (first && now - lastOpenHoleBumpMs >= 500) {
+        if (first && now - lastOpenHoleBumpMs >= 2_000) {
             lastOpenHoleBumpMs = now;
             bumpSwarmGeneration();
             freeRouteBoostUntilTick = Math.max(freeRouteBoostUntilTick, level.getGameTime() + FREE_ROUTE_BOOST_TICKS);
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info("[OpenHole] {} near player — pack funnel", imm);
+                ChallengeMod.LOGGER.debug("[OpenHole] {} near player — pack funnel", imm);
             }
         }
     }
@@ -234,7 +234,7 @@ public class MobPathManager {
         }
         if (!isValidFreeRoute(level, path, playerPos)) {
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info(
+                ChallengeMod.LOGGER.debug(
                         "[FreeRoute] rejected nodes={} end={} (not a real path into player)",
                         path.size(), path.get(path.size() - 1));
             }
@@ -264,7 +264,7 @@ public class MobPathManager {
         if (isNew) {
             bumpSwarmGeneration();
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info(
+                ChallengeMod.LOGGER.debug(
                         "[FreeRoute] published nodes={} entry={} end={} — ALL mobs funnel",
                         path.size(),
                         sharedFreeRoute.entryPos,
@@ -490,7 +490,7 @@ public class MobPathManager {
                 sharedFreeRoute = null;
                 free = null;
                 if (ChallengeMod.isAStarDebugEnabled() && currentTick % 40 == 0) {
-                    ChallengeMod.LOGGER.info("[FreeRoute] cleared invalid exterior route");
+                    ChallengeMod.LOGGER.debug("[FreeRoute] cleared invalid exterior route");
                 }
             }
         }
@@ -514,7 +514,7 @@ public class MobPathManager {
                     onFreeCorridor = true;
                     swarmRepath = false;
                     if (ChallengeMod.isAStarDebugEnabled() && currentTick % 40 == 0) {
-                        ChallengeMod.LOGGER.info(
+                        ChallengeMod.LOGGER.debug(
                                 "[FreeRoute] mob={} funnel nodes={} idx={} entry={}",
                                 mob.getUUID().toString().substring(0, 4),
                                 cached.path.size(),
@@ -583,9 +583,10 @@ public class MobPathManager {
             }
         }
 
-        // Swarm / free-route repath and long-stuck must not be throttled
-        int replanInterval = freeAvailable ? 15 : RECALCULATE_INTERVAL;
-        if (cached != null && needsRecalculation && !stuckReplan && !swarmRepath
+        // Every mob observes a minimum interval. Swarm changes prioritize the next plan,
+        // but never permit repeated full searches in adjacent ticks.
+        int replanInterval = freeAvailable ? 30 : RECALCULATE_INTERVAL;
+        if (cached != null && needsRecalculation && !stuckReplan
                 && currentTick - cached.lastRecalcTick < replanInterval) {
             needsRecalculation = false;
         }
@@ -655,10 +656,10 @@ public class MobPathManager {
                         }
                         pathCache.put(mob.getUUID(), cached);
 
-                        if (ChallengeMod.isAStarDebugEnabled()
+                        if (ChallengeMod.isAStarDebugEnabled() && ChallengeMod.LOGGER.isDebugEnabled()
                                 && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                             cached.lastBuildLogTick = currentTick;
-                            ChallengeMod.LOGGER.info(
+                            ChallengeMod.LOGGER.debug(
                                     "[Path] mob={} strategy={} partial={} nodes={} maxY={} cost={} maxBreakH={} end={}",
                                     mob.getUUID().toString().substring(0, 4),
                                     strategy,
@@ -743,7 +744,7 @@ public class MobPathManager {
                         clearClientPath(mob);
                         BuildPlanData.removeBuildPlan(mob.getUUID());
                         if (ChallengeMod.isAStarDebugEnabled()) {
-                            ChallengeMod.LOGGER.info("[BuildPlan] mob={} cancelled reason=mobGriefing_disabled",
+                            ChallengeMod.LOGGER.debug("[BuildPlan] mob={} cancelled reason=mobGriefing_disabled",
                                     mob.getUUID().toString().substring(0, 4));
                         }
                         return false;
@@ -777,14 +778,14 @@ public class MobPathManager {
                               if (ChallengeMod.isAStarDebugEnabled()
                                       && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                                   cached.lastBuildLogTick = currentTick;
-                                  ChallengeMod.LOGGER.info(
+                                  ChallengeMod.LOGGER.debug(
                                           "[BuildPlan] mob={} skipped reason=build_target_already_filled pos={}",
                                           mob.getUUID().toString().substring(0, 4), buildTarget);
                               }
                           } else if (ChallengeMod.isAStarDebugEnabled()
                                   && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                               cached.lastBuildLogTick = currentTick;
-                              ChallengeMod.LOGGER.info(
+                              ChallengeMod.LOGGER.debug(
                                       "[BuildPlan] mob={} cancelled reason=build_target_blocked pos={}",
                                       mob.getUUID().toString().substring(0, 4), buildTarget);
                           }
@@ -816,7 +817,7 @@ public class MobPathManager {
                                 cached.lastBreakTick = currentTick;
                                 registerBreach(mob.level(), swarmHole);
                                 if (ChallengeMod.isAStarDebugEnabled() && currentTick % 20 == 0) {
-                                    ChallengeMod.LOGGER.info(
+                                    ChallengeMod.LOGGER.debug(
                                             "[SwarmDig] mob={} focus {} dmg={}",
                                             mob.getUUID().toString().substring(0, 4), swarmHole,
                                             String.format("%.2f", MobBreakerHandler.getBlockDamage(mob.level(), swarmHole)));
@@ -855,7 +856,7 @@ public class MobPathManager {
                                     cached.lastBreakTick = currentTick;
                                     registerBreach(mob.level(), under);
                                     if (ChallengeMod.isAStarDebugEnabled() && currentTick % 20 == 0) {
-                                        ChallengeMod.LOGGER.info(
+                                        ChallengeMod.LOGGER.debug(
                                                 "[PathDig] mob={} digging floor {} → next {}",
                                                 mob.getUUID().toString().substring(0, 4), under, nextNode);
                                     }
@@ -908,7 +909,7 @@ public class MobPathManager {
                             if (ChallengeMod.isAStarDebugEnabled() && cannotBreakBlocked
                                     && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                                 cached.lastBuildLogTick = currentTick;
-                                ChallengeMod.LOGGER.info(
+                                ChallengeMod.LOGGER.debug(
                                         "[PathBreak] mob={} strategy={} skip_too_hard next={} — replanning",
                                         mob.getUUID().toString().substring(0, 4), cached.strategy, nextNode);
                             }
@@ -1254,7 +1255,7 @@ public class MobPathManager {
             }
 
             if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
-                ChallengeMod.LOGGER.info("[EnterHole] mob={} → {} needUp={} horiz={}",
+                ChallengeMod.LOGGER.debug("[EnterHole] mob={} → {} needUp={} horiz={}",
                         mob.getUUID().toString().substring(0, 4), node,
                         String.format("%.2f", needUp), String.format("%.2f", horiz));
             }
@@ -1273,7 +1274,7 @@ public class MobPathManager {
             double up = 0.38;
             mob.setDeltaMovement(dx * push, Math.max(mob.getDeltaMovement().y, up), dz * push);
             if (ChallengeMod.isAStarDebugEnabled() && cached != null && mob.tickCount % 20 == 0) {
-                ChallengeMod.LOGGER.info("[Climb] mob={} → {} needUp={}",
+                ChallengeMod.LOGGER.debug("[Climb] mob={} → {} needUp={}",
                         mob.getUUID().toString().substring(0, 4), node,
                         String.format("%.1f", needUp));
             }
@@ -1357,7 +1358,7 @@ public class MobPathManager {
         mob.setDeltaMovement(dx * pull, Math.min(mob.getDeltaMovement().y, fall), dz * pull);
 
         if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
-            ChallengeMod.LOGGER.info("[RoofDrop] mob={} through {} → landing={} horiz={}",
+            ChallengeMod.LOGGER.debug("[RoofDrop] mob={} through {} → landing={} horiz={}",
                     mob.getUUID().toString().substring(0, 4),
                     hatchOpenCell,
                     landing,
@@ -1413,7 +1414,7 @@ public class MobPathManager {
                 return true;
             }
             if (ChallengeMod.isAStarDebugEnabled() && tick % 80 == 0) {
-                ChallengeMod.LOGGER.info("[RoofDrop] mob={} skip drop {} — no A* path to player",
+                ChallengeMod.LOGGER.debug("[RoofDrop] mob={} skip drop {} — no A* path to player",
                         mob.getUUID().toString().substring(0, 4), under);
             }
         }
@@ -1445,7 +1446,7 @@ public class MobPathManager {
                     forceDropThroughHatch(mob, openHatch);
                 }
                 if (ChallengeMod.isAStarDebugEnabled() && tick % 40 == 0) {
-                    ChallengeMod.LOGGER.info("[RoofDrop] mob={} verified hatch {} dist={}",
+                    ChallengeMod.LOGGER.debug("[RoofDrop] mob={} verified hatch {} dist={}",
                             mob.getUUID().toString().substring(0, 4), openHatch, String.format("%.1f", dist));
                 }
                 return true;
@@ -1497,11 +1498,14 @@ public class MobPathManager {
             }
         }
 
-        // Budget: only a few hatch A* proofs per server tick
-        if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK) {
-            return false; // try again next ticks; cache will fill eventually
+        // Hatch proofs share the global planner budget so they cannot stack with a full hunt plan.
+        if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK
+                || pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
+                || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
+            return false; // try later; cached movement continues meanwhile
         }
         hatchAstarsThisTick++;
+        pathCalcsPerTick++;
 
         AStarPathfinder.PathResult walk = AStarPathfinder.findPath(mob, landing, playerPos, false, false, 0);
         boolean ok = walk.found && walk.path != null && !walk.path.isEmpty();
@@ -1537,7 +1541,7 @@ public class MobPathManager {
             }
             publishFreeRoute(level, full, playerPos);
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info("[HatchOK] hatch={} landing={} → player nodes={}",
+                ChallengeMod.LOGGER.debug("[HatchOK] hatch={} landing={} → player nodes={}",
                         openCell, landing, full.size());
             }
         }
@@ -1638,7 +1642,9 @@ public class MobPathManager {
             if (checked >= 3) {
                 break; // cap proofs per scan
             }
-            if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK) {
+            if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK
+                    || pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
+                    || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
                 // Prefer cache hits only
                 DimPos lk = new DimPos(mob.level().dimension(),
                         Optional.ofNullable(findLandingBelowNearPlayer(mob.level(), floor, target.blockPosition(), 12))
@@ -1720,7 +1726,7 @@ public class MobPathManager {
         for (BlockPos pos : candidates) {
             if (tryBreakSoftCeiling(mob, pos, cached)) {
                 if (ChallengeMod.isAStarDebugEnabled() && tick % 20 == 0) {
-                    ChallengeMod.LOGGER.info("[HatchDig] mob={} breaking ceiling {} (player below at y={})",
+                    ChallengeMod.LOGGER.debug("[HatchDig] mob={} breaking ceiling {} (player below at y={})",
                             mob.getUUID().toString().substring(0, 4), pos, (int) target.getY());
                 }
                 return true;
@@ -1851,7 +1857,7 @@ public class MobPathManager {
                 count++;
             }
         }
-        ChallengeMod.LOGGER.info("[BuildPlan] mob={} reason={} strategy={} actions={} first={} last={} target={}",
+        ChallengeMod.LOGGER.debug("[BuildPlan] mob={} reason={} strategy={} actions={} first={} last={} target={}",
                 mob.getUUID().toString().substring(0, 4),
                 reason,
                 cached.strategy,

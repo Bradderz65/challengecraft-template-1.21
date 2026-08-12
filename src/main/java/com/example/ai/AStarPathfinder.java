@@ -24,8 +24,8 @@ import java.util.*;
  */
 public class AStarPathfinder {
 
-    /** Absolute cap on expanded nodes per search. */
-    private static final int MAX_NODES_HARD = 2800;
+    /** Absolute cap on expanded nodes per search. Partial paths continue on later replans. */
+    private static final int MAX_NODES_HARD = 1400;
 
     /**
      * Ignore reopenings that improve g by less than this (Baritone-style min improvement).
