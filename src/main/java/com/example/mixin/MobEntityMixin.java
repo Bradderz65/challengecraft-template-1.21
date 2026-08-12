@@ -26,7 +26,10 @@ public abstract class MobEntityMixin {
 	private int retargetCooldown;
 
 	@Unique
-	private boolean huntRangeSet;
+	private double originalFollowRange = Double.NaN;
+
+	@Unique
+	private double appliedHuntRange = Double.NaN;
 
 	@Unique
 	private static final double WATER_SPEED_MULTIPLIER = 1.8D;
@@ -42,11 +45,7 @@ public abstract class MobEntityMixin {
 			return;
 		}
 
-		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
-		if (followRange != null && followRange.getBaseValue() < HuntRules.getHuntRange()) {
-			followRange.setBaseValue(HuntRules.getHuntRange());
-		}
-		this.huntRangeSet = true;
+		ensureHuntRange(mob);
 	}
 
 	@Inject(method = "aiStep", at = @At("HEAD"))
@@ -63,9 +62,7 @@ public abstract class MobEntityMixin {
 			return;
 		}
 
-		if (!this.huntRangeSet) {
-			ensureHuntRange(mob);
-		}
+		ensureHuntRange(mob);
 
 		int interval = ChallengeMod.getTargetIntervalTicks();
 		if (interval > 1 && (mob.tickCount % interval) != 0) {
@@ -452,8 +449,16 @@ public abstract class MobEntityMixin {
 	@Unique
 	private void ensureHuntRange(Mob mob) {
 		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
-		if (followRange != null && followRange.getBaseValue() < HuntRules.getHuntRange()) {
-			followRange.setBaseValue(HuntRules.getHuntRange());
+		if (followRange == null) {
+			return;
+		}
+		if (!Double.isFinite(this.originalFollowRange)) {
+			this.originalFollowRange = followRange.getBaseValue();
+		}
+		double desiredRange = Math.max(this.originalFollowRange, HuntRules.getHuntRange());
+		if (Double.compare(desiredRange, this.appliedHuntRange) != 0) {
+			followRange.setBaseValue(desiredRange);
+			this.appliedHuntRange = desiredRange;
 		}
 	}
 

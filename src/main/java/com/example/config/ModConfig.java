@@ -3,6 +3,7 @@ package com.example.config;
 import com.example.ChallengeMod;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParseException;
 import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.IOException;
@@ -52,8 +53,8 @@ public class ModConfig {
                     data = new ConfigData();
                 }
                 ChallengeMod.LOGGER.info("ChallengeCraft config loaded");
-            } catch (IOException e) {
-                ChallengeMod.LOGGER.error("Failed to load config", e);
+            } catch (IOException | JsonParseException e) {
+                ChallengeMod.LOGGER.error("Failed to load config; using defaults", e);
                 data = new ConfigData();
             }
         } else {
@@ -61,7 +62,7 @@ public class ModConfig {
             save();
         }
 
-        // Apply loaded config to main mod
+        normalize();
         applyToMod();
     }
 
@@ -105,7 +106,7 @@ public class ModConfig {
     public static ChallengeMod.TargetMode getTargetMode() {
         try {
             return ChallengeMod.TargetMode.valueOf(data.targetMode);
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException | NullPointerException e) {
             return ChallengeMod.TargetMode.FAST;
         }
     }
@@ -145,7 +146,7 @@ public class ModConfig {
     }
 
     public static void setSpeedMultiplier(double multiplier) {
-        data.speedMultiplier = Math.max(0.1, Math.min(10.0, multiplier));
+        data.speedMultiplier = clampFinite(multiplier, 0.1, 10.0, 1.0);
     }
 
     public static void setAntiTowerEnabled(boolean enabled) {
@@ -153,11 +154,11 @@ public class ModConfig {
     }
 
     public static void setAntiTowerDelay(double delay) {
-        data.antiTowerDelay = Math.max(0.5, Math.min(30.0, delay));
+        data.antiTowerDelay = clampFinite(delay, 0.5, 30.0, 3.0);
     }
 
     public static void setHuntRange(double range) {
-        data.huntRange = Math.max(10.0, Math.min(500.0, range));
+        data.huntRange = clampFinite(range, 10.0, 500.0, 50.0);
     }
 
     public static void setAStarEnabled(boolean enabled) {
@@ -166,5 +167,22 @@ public class ModConfig {
 
     public static void setAStarDebugEnabled(boolean enabled) {
         data.aStarDebugEnabled = enabled;
+    }
+
+    private static void normalize() {
+        setTargetMode(getTargetMode());
+        setSpeedMultiplier(data.speedMultiplier);
+        setAntiTowerDelay(data.antiTowerDelay);
+        setHuntRange(data.huntRange);
+        if (!data.aStarEnabled) {
+            data.aStarDebugEnabled = false;
+        }
+    }
+
+    private static double clampFinite(double value, double min, double max, double fallback) {
+        if (!Double.isFinite(value)) {
+            return fallback;
+        }
+        return Math.max(min, Math.min(max, value));
     }
 }
