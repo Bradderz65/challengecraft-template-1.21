@@ -9,6 +9,7 @@ import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.animal.Animal;
+import net.minecraft.world.entity.monster.AbstractSkeleton;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
@@ -104,6 +105,15 @@ public abstract class MobEntityMixin {
 		if (mob.getTarget() != target) {
 			mob.setTarget(target);
 		}
+
+		// Skeletons always face the player in hunt range so bow AI aims through walls
+		if (mob instanceof AbstractSkeleton) {
+			double bowRange = 20.0;
+			if (mob.distanceToSqr(target) <= bowRange * bowRange) {
+				mob.getLookControl().setLookAt(target, 30.0F, 30.0F);
+			}
+		}
+
 		double speed = ChallengeMod.getSpeedMultiplier();
 		if (mob.isInWaterOrBubble()) {
 			speed *= WATER_SPEED_MULTIPLIER;
@@ -151,19 +161,28 @@ public abstract class MobEntityMixin {
 					// If distance > 2.25 (1.5 blocks), it's a gap jump.
 					// Also ensure we are facing it roughly? Or just force velocity.
 					if (distSqrHorizontal > 2.25 && nextDeltaY == 1 && hasLanding) {
-						mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
-								nextNode.getZ() + 0.5);
-						// Jump if on ground (and maybe slightly before edge?)
-						if (mob.onGround()) {
-							mob.getJumpControl().jump();
-							// Boost speed slightly
-							mob.setSprinting(true);
-							// Explicitly push towards target to ensure we clear the gap
-							Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
-							double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
-							if (currentSpeed < 0.3) {
-								mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.15)));
+						BlockPos n0 = nextNode;
+						boolean holeEnter = !mob.level().getBlockState(n0).blocksMotion()
+								&& !mob.level().getBlockState(n0.above()).blocksMotion()
+								&& n0.getY() - mob.getY() < 1.15 && n0.getY() - mob.getY() > -0.6;
+						// Enter-hole phase already owns velocity (assistClimbTo); do not gap-jump over it.
+						if (!holeEnter) {
+							mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
+									nextNode.getZ() + 0.5);
+							// Jump if on ground (and maybe slightly before edge?)
+							if (mob.onGround()) {
+								mob.getJumpControl().jump();
+								// Boost speed slightly
+								mob.setSprinting(true);
+								// Explicitly push towards target to ensure we clear the gap
+								Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
+								double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
+								if (currentSpeed < 0.3) {
+									mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.15)));
+								}
 							}
+						} else {
+							mob.setSprinting(false);
 						}
 					} else {
 						mob.setSprinting(false);
@@ -241,10 +260,41 @@ public abstract class MobEntityMixin {
 		// One-block steps should use normal jumping.
 		boolean targetAbove = pathNeedsClimb || (targetDeltaY >= 1 && hasWallFace);
 
+		// If A* is routing *around* at ground level, do NOT climb the face (door detour).
+		// If the path goes *up* (roof cobble / tower), climb must stay enabled.
+		boolean pathIsLateralDetour = false;
+		if (usingAStar && cachedPath != null && !cachedPath.isComplete()) {
+			BlockPos pathNode = cachedPath.getNextNode();
+			if (pathNode != null) {
+				int pdx = pathNode.getX() - mobBlockPos.getX();
+				int pdz = pathNode.getZ() - mobBlockPos.getZ();
+				int pdy = pathNode.getY() - mobBlockY;
+				// Only suppress climb when the next step is sideways/down, not upward
+				pathIsLateralDetour = pdy <= 0 && (Math.abs(pdx) + Math.abs(pdz)) >= 1;
+			}
+		}
+
 		// Only maintain height while already climbing if we're still headed upward or blocked for an upward move.
 		boolean maintenanceHover = !mob.onGround() && (pathNeedsClimb || (targetDeltaY >= 1 && hasWallFace));
 
-		if ((mob.horizontalCollision || isNextToWall) && (targetAbove || maintenanceHover)) {
+		// When A* is in its ENTER-HOLE phase, assistClimbTo already moves the mob
+		// into the open cell. If this wall-climb block also writes velocity, the two
+		// fight every tick and the mob bounces forever at the lip. Skip it entirely.
+		boolean enterHoleActive = false;
+		if (usingAStar && cachedPath != null && !cachedPath.isComplete()) {
+			BlockPos n = cachedPath.getNextNode();
+			if (n != null && !mob.level().getBlockState(n).blocksMotion()
+					&& !mob.level().getBlockState(n.above()).blocksMotion()) {
+				double enterNeedUp = n.getY() - mob.getY();
+				double enterDx = n.getX() + 0.5 - mob.getX();
+				double enterDz = n.getZ() + 0.5 - mob.getZ();
+				double enterHoriz = Math.sqrt(enterDx * enterDx + enterDz * enterDz);
+				enterHoleActive = enterNeedUp < 1.15 && enterNeedUp > -0.6 && enterHoriz < 2.25;
+			}
+		}
+
+		if (!enterHoleActive && !pathIsLateralDetour && (mob.horizontalCollision || isNextToWall)
+				&& (targetAbove || maintenanceHover)) {
 			Vec3 motion = mob.getDeltaMovement();
 			if (motion.y < 0.2) {
 				// "Wall Suction": Adjust steering target to be CLOSER to the wall, not center
@@ -298,56 +348,67 @@ public abstract class MobEntityMixin {
 				double latchSpeed = 0.2;
 
 				boolean isVaulting = Math.abs(steeringTarget.y - mob.getY()) < 1.5;
+				double distSq = (steeringTarget.x - mob.getX()) * (steeringTarget.x - mob.getX())
+						+ (steeringTarget.z - mob.getZ()) * (steeringTarget.z - mob.getZ());
 
-				if (isVaulting) {
-					// VAULTING LOGIC:
-					// We are near the top. We need to clear the ledge.
-					latchSpeed = 0.25; // Good strength to crest
-
-					// Important: If we are targetting a small pillar, we might overshoot.
-					// Check horizontal distance to node center.
-					double distSq = (steeringTarget.x - mob.getX()) * (steeringTarget.x - mob.getX()) +
-							(steeringTarget.z - mob.getZ()) * (steeringTarget.z - mob.getZ());
-
-					if (distSq < 0.25) { // Within 0.5 blocks
-						latchSpeed = 0.1; // Slow down to land
+				// Is the path node an open hole we should crawl into (not bounce on)?
+				boolean openHole = false;
+				if (cachedPath != null && !cachedPath.isComplete()) {
+					BlockPos n = cachedPath.getNextNode();
+					if (n != null) {
+						openHole = !mob.level().getBlockState(n).blocksMotion()
+								&& !mob.level().getBlockState(n.above()).blocksMotion();
 					}
-
-					// Ensure we don't have suction pulling us back while vaulting
-					// (The suction logic used 'else' branch above, so target isn't shifted, which
-					// is correct)
 				}
 
-				// Apply velocity: Target-driven only, kill existing momentum drift
-				mob.setDeltaMovement(new Vec3(pushDir.x * latchSpeed, climbY, pushDir.z * latchSpeed));
-				mob.fallDistance = 0.0F;
-
-				// Help them latch onto ledges
-				if (mob.onGround()) {
-					mob.getJumpControl().jump();
+				if (isVaulting && openHole && distSq < 6.25) {
+					// ENTER HOLE: strong horizontal into open cell, almost no upward bounce
+					latchSpeed = distSq < 0.36 ? 0.22 : 0.42;
+					double belowLip = steeringTarget.y - mob.getY();
+					if (belowLip > 0.35) {
+						climbY = 0.28;
+						if (mob.onGround()) {
+							mob.getJumpControl().jump();
+						}
+					} else if (belowLip > 0.05) {
+						climbY = 0.12;
+					} else {
+						// At or above hole floor — settle in, do NOT keep jumping
+						climbY = Math.min(Math.max(motion.y, -0.05), 0.08);
+					}
+					mob.setDeltaMovement(new Vec3(pushDir.x * latchSpeed, climbY, pushDir.z * latchSpeed));
+					mob.fallDistance = 0.0F;
+				} else if (isVaulting) {
+					// VAULTING onto solid ledge
+					latchSpeed = distSq < 0.25 ? 0.12 : 0.28;
+					climbY = mob.getY() < steeringTarget.y - 0.2 ? 0.22 : 0.08;
+					mob.setDeltaMovement(new Vec3(pushDir.x * latchSpeed, climbY, pushDir.z * latchSpeed));
+					mob.fallDistance = 0.0F;
+					if (mob.onGround() && mob.getY() < steeringTarget.y - 0.25) {
+						mob.getJumpControl().jump();
+					}
+				} else {
+					// Climbing face toward higher target
+					mob.setDeltaMovement(new Vec3(pushDir.x * latchSpeed, climbY, pushDir.z * latchSpeed));
+					mob.fallDistance = 0.0F;
+					if (mob.onGround()) {
+						mob.getJumpControl().jump();
+					}
 				}
 			}
 		}
 
-		// Ceiling Breaker: If climbing but hitting head (vertical collision up), ensure
-		// we break the block above
+		// Ceiling Breaker: climbing into a soft/medium block above — never netherite/obsidian
 		if (mob.verticalCollision && target.getY() > mob.getY()) {
-			// Trigger breaker handler for blocks directly above
+			float maxH = com.example.antitower.MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
+			var climbPath = com.example.ai.MobPathManager.getCachedPath(mob);
+			if (climbPath != null) {
+				maxH = climbPath.maxBreakHardness;
+			}
 			BlockPos headerPos = mob.blockPosition().above(2);
-			// Also check directly above head (above 1) in case of crouching/short mobs or
-			// 1-high gaps
 			BlockPos directAbove = mob.blockPosition().above();
-
-			if (mob.level().getBlockState(headerPos).getDestroySpeed(mob.level(), headerPos) >= 0) {
-				com.example.antitower.MobBreakerHandler.damageBlock(
-						(net.minecraft.server.level.ServerLevel) mob.level(), headerPos, mob,
-						mob.level().getBlockState(headerPos).getDestroySpeed(mob.level(), headerPos));
-			}
-			if (mob.level().getBlockState(directAbove).getDestroySpeed(mob.level(), directAbove) >= 0) {
-				com.example.antitower.MobBreakerHandler.damageBlock(
-						(net.minecraft.server.level.ServerLevel) mob.level(), directAbove, mob,
-						mob.level().getBlockState(directAbove).getDestroySpeed(mob.level(), directAbove));
-			}
+			com.example.antitower.MobBreakerHandler.tickBreaking(mob, headerPos, maxH);
+			com.example.antitower.MobBreakerHandler.tickBreaking(mob, directAbove, maxH);
 		}
 
 		// Anti-Clumping / Pillar Chasing Logic / Smart Siege

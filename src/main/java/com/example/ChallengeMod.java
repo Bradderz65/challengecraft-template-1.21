@@ -9,7 +9,10 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.effect.MobEffects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -182,6 +185,13 @@ public class ChallengeMod implements ModInitializer {
 							.then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.1D))
 									.executes(context -> setSpeedMultiplier(context.getSource(),
 											DoubleArgumentType.getDouble(context, "multiplier"))))));
+
+			dispatcher.register(Commands.literal("heal")
+					.requires(source -> source.hasPermission(2))
+					.executes(context -> healPlayer(context.getSource(), context.getSource().getPlayerOrException()))
+					.then(Commands.argument("player", EntityArgument.player())
+							.executes(context -> healPlayer(context.getSource(),
+									EntityArgument.getPlayer(context, "player")))));
 		});
 
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
@@ -222,6 +232,32 @@ public class ChallengeMod implements ModInitializer {
 		ModConfig.setTargetMode(mode);
 		ModConfig.save();
 		source.sendSuccess(() -> Component.literal("Targeting mode set to " + mode.name().toLowerCase()), false);
+		return 1;
+	}
+
+	/** Fully restore health, food, and clear common negative combat state. */
+	private static int healPlayer(CommandSourceStack source, ServerPlayer player) {
+		player.setHealth(player.getMaxHealth());
+		player.getFoodData().setFoodLevel(20);
+		player.getFoodData().setSaturation(20.0f);
+		player.getFoodData().setExhaustion(0.0f);
+		player.clearFire();
+		player.setAirSupply(player.getMaxAirSupply());
+		player.removeEffect(MobEffects.POISON);
+		player.removeEffect(MobEffects.WITHER);
+		player.removeEffect(MobEffects.HUNGER);
+		player.removeEffect(MobEffects.WEAKNESS);
+		player.removeEffect(MobEffects.MOVEMENT_SLOWDOWN);
+		player.removeEffect(MobEffects.BLINDNESS);
+		player.removeEffect(MobEffects.CONFUSION);
+		player.removeEffect(MobEffects.LEVITATION);
+		player.hurtMarked = true;
+
+		String name = player.getName().getString();
+		source.sendSuccess(() -> Component.literal("Fully healed " + name), true);
+		if (source.getEntity() != player) {
+			player.displayClientMessage(Component.literal("You have been fully healed."), true);
+		}
 		return 1;
 	}
 
