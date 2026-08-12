@@ -53,14 +53,11 @@ public class MobPathManager {
     
     // Global throttling to prevent server overload
     private static int pathCalcsPerTick = 0;
-    private static int hatchAstarsThisTick = 0;
     private static long lastTick = 0;
     private static long lastMetadataCleanupTick = Long.MIN_VALUE;
 
     /** Hard cap on all A* plans per server tick. Cached paths continue moving meanwhile. */
     private static final int MAX_PATH_CALCS_PER_TICK = 1;
-    /** Hatch verification shares the same global A* budget. */
-    private static final int MAX_HATCH_ASTAR_PER_TICK = 1;
     /** Never increase same-tick work when a route opens; prioritize through generations instead. */
     private static final int FREE_ROUTE_BOOST_CALCS = 1;
     private static final int FREE_ROUTE_BOOST_TICKS = 30; // 1.5s
@@ -409,13 +406,6 @@ public class MobPathManager {
         });
         openHoles.entrySet().removeIf(entry -> now - entry.getValue() > OPEN_HOLE_EXPIRY_MS);
         mobPlacedBlocks.entrySet().removeIf(entry -> now - entry.getValue() > MOB_PLACED_BLOCK_EXPIRY_MS);
-        dropReachTime.entrySet().removeIf(entry -> {
-            if (now - entry.getValue() <= DROP_REACH_CACHE_MS) {
-                return false;
-            }
-            dropReachCache.remove(entry.getKey());
-            return true;
-        });
         pathFailures.entrySet().removeIf(entry -> now - entry.getValue() > 5_000);
     }
 
@@ -441,7 +431,6 @@ public class MobPathManager {
         if (currentTick != lastTick) {
             lastTick = currentTick;
             pathCalcsPerTick = 0;
-            hatchAstarsThisTick = 0;
             cleanupExpiredMetadata(currentTick);
         }
 
@@ -505,7 +494,7 @@ public class MobPathManager {
             // Partials, dig routes, stuck, swarm, or not near corridor → force onto free path
             // Never run extra A* here — free route adopt is the cheap path for the pack.
             if (!alreadyOnFree || swarmRepath || (cached != null && (cached.partial || !"Standard".equals(cached.strategy)))) {
-                CachedMobPath adopted = joinFreeRoute(mob, free, targetPos, currentTick, false);
+                CachedMobPath adopted = joinFreeRoute(mob, free, targetPos, currentTick);
                 if (adopted != null) {
                     cached = adopted;
                     pathCache.put(mob.getUUID(), cached);
@@ -604,7 +593,7 @@ public class MobPathManager {
                     String strategy;
 
                     if (freeAvailable) {
-                        CachedMobPath joined = joinFreeRoute(mob, free, targetPos, currentTick, false);
+                        CachedMobPath joined = joinFreeRoute(mob, free, targetPos, currentTick);
                         if (joined != null) {
                             result = new AStarPathfinder.PathResult(joined.path, true, false, 0,
                                     Collections.emptyMap(), 0);
@@ -832,41 +821,11 @@ public class MobPathManager {
                         }
                     }
 
-                    // Roof: dig soft cobble first; only DROP if A* can reach player from landing
-                    if (tryRoofDropToPlayer(mob, target, cached, mobGriefing)) {
+                    // Downward transitions are already proven by A*. Execute that exact
+                    // shaft instead of running separate hatch scans and verification searches.
+                    if (nextNode.getY() < mob.blockPosition().getY()
+                            && executePlannedDrop(mob, nextNode, cached, mobGriefing, currentTick)) {
                         return true;
-                    }
-
-                    // Path goes down: dig soft floor, or drop only if that landing reaches the player
-                    if (nextNode.getY() < mob.blockPosition().getY()) {
-                        BlockPos under = mob.blockPosition().below();
-                        if (!isSolid(mob.level(), under)) {
-                            if (hatchReachesPlayer(mob, target, under)) {
-                                forceDropThroughHatch(mob, under);
-                                return true;
-                            }
-                            // Open air but no path to player from below — do not false-drop
-                        } else {
-                            float h = mob.level().getBlockState(under).getDestroySpeed(mob.level(), under);
-                            float digCap = Math.max(cached.maxBreakHardness, 3.0f);
-                            if (mobGriefing && h >= 0 && h <= digCap) {
-                                if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
-                                    MobBreakerHandler.tickBreaking(mob, under, digCap);
-                                    MobBreakerHandler.tickBreaking(mob, under, digCap);
-                                    cached.lastBreakTick = currentTick;
-                                    registerBreach(mob.level(), under);
-                                    if (ChallengeMod.isAStarDebugEnabled() && currentTick % 20 == 0) {
-                                        ChallengeMod.LOGGER.debug(
-                                                "[PathDig] mob={} digging floor {} → next {}",
-                                                mob.getUUID().toString().substring(0, 4), under, nextNode);
-                                    }
-                                }
-                                mob.getLookControl().setLookAt(under.getX() + 0.5, under.getY() + 0.5,
-                                        under.getZ() + 0.5);
-                                mob.getNavigation().stop();
-                                return true;
-                            }
-                        }
                     }
 
                     boolean isBlocked = false;
@@ -925,15 +884,6 @@ public class MobPathManager {
                     }
 
                     double speed = ChallengeMod.getSpeedMultiplier();
-                    // Drop only when next is lower AND that route can reach the player
-                    if (nextNode.getY() < mob.getY() - 0.2) {
-                        if (hatchReachesPlayer(mob, target, nextNode)
-                                || (cached.path != null && pathEndsNearPlayer(cached.path, target.blockPosition()))) {
-                            forceDropThroughHatch(mob, nextNode);
-                            return true;
-                        }
-                        // Fall through to normal move — may replan instead of false-drop
-                    }
                     assistClimbTo(mob, nextNode, speed, cached);
                     return true;
                 }
@@ -1011,8 +961,7 @@ public class MobPathManager {
      * Force this mob onto the proven free corridor to the player.
      * Near: snap onto path. Far: walk to corridor entry (or nearest node), then free path to player.
      */
-    private static CachedMobPath joinFreeRoute(Mob mob, SharedFreeRoute free, BlockPos targetPos, long currentTick,
-            boolean allowAStar) {
+    private static CachedMobPath joinFreeRoute(Mob mob, SharedFreeRoute free, BlockPos targetPos, long currentTick) {
         if (free == null || free.path.isEmpty()) {
             return null;
         }
@@ -1045,36 +994,8 @@ public class MobPathManager {
             for (int i = best; i < free.path.size(); i++) {
                 combined.add(free.path.get(i));
             }
-        } else if (allowAStar) {
-            // Walk to join point, then free path to player (still cheaper than dig-around)
-            BlockPos join = free.path.get(best);
-            // Prefer corridor mouth when farther from player than the nearest node is
-            if (mobPos.distSqr(free.entryPos) + 16 < mobPos.distSqr(join)) {
-                join = free.entryPos;
-                for (int i = 0; i < free.path.size(); i++) {
-                    if (free.path.get(i).equals(free.entryPos)) {
-                        best = i;
-                        break;
-                    }
-                }
-            }
-            AStarPathfinder.PathResult toJoin = AStarPathfinder.findPath(mob, mobPos, join, false, false, 0);
-            if (toJoin.found && !toJoin.path.isEmpty()) {
-                combined.addAll(toJoin.path);
-            } else if (toJoin.usable()) {
-                combined.addAll(toJoin.path);
-            } else {
-                // Still funnel: path starts at join; movement walks/jumps toward it
-                combined.add(join);
-            }
-            for (int i = best; i < free.path.size(); i++) {
-                BlockPos n = free.path.get(i);
-                if (combined.isEmpty() || !combined.get(combined.size() - 1).equals(n)) {
-                    combined.add(n);
-                }
-            }
         } else {
-            // No A* budget: still assign free corridor from nearest / entry
+            // Far from the corridor: approach its entry without another A* search.
             BlockPos join = bestDist > 10 ? free.entryPos : free.path.get(best);
             if (bestDist > 10) {
                 for (int i = 0; i < free.path.size(); i++) {
@@ -1321,347 +1242,62 @@ public class MobPathManager {
         }
     }
 
-    /**
-     * Drop through an open hatch: stay centered on the hole and apply strong downward motion.
-     */
-    private static void forceDropThroughHatch(Mob mob, BlockPos hatchOpenCell) {
+    /** Execute a downward edge already validated by the main A* search. */
+    private static boolean executePlannedDrop(Mob mob, BlockPos landing, CachedMobPath cached,
+            boolean mobGriefing, long currentTick) {
         Level level = mob.level();
-        BlockPos landing = findLandingBelow(level, hatchOpenCell, 10);
-        double nx = hatchOpenCell.getX() + 0.5;
-        double nz = hatchOpenCell.getZ() + 0.5;
-        double ny = landing != null ? landing.getY() + 0.1 : mob.getY() - 2.0;
-
-        mob.getNavigation().stop();
-        mob.getMoveControl().setWantedPosition(nx, ny, nz, ChallengeMod.getSpeedMultiplier());
-        mob.getLookControl().setLookAt(nx, ny, nz);
-        mob.setNoGravity(false);
-
-        double dx = nx - mob.getX();
-        double dz = nz - mob.getZ();
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        if (horiz > 0.02) {
-            dx /= horiz;
-            dz /= horiz;
-        } else {
-            dx = 0;
-            dz = 0;
-        }
-
-        // Pull into hole center; once centered, fall hard
-        double pull = horiz > 0.35 ? 0.18 : 0.04;
-        double fall = horiz > 0.45 ? -0.12 : -0.55;
-        // Also step slightly into the hole from the lip
-        if (horiz > 0.2 && horiz < 0.9 && mob.onGround()) {
-            pull = 0.28;
-            fall = -0.15;
-        }
-        mob.setDeltaMovement(dx * pull, Math.min(mob.getDeltaMovement().y, fall), dz * pull);
-
-        if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
-            ChallengeMod.LOGGER.debug("[RoofDrop] mob={} through {} → landing={} horiz={}",
-                    mob.getUUID().toString().substring(0, 4),
-                    hatchOpenCell,
-                    landing,
-                    String.format("%.2f", horiz));
-        }
-    }
-
-    /** Landing cells from which walk A* can reach the player (positive/negative cache). */
-    private static final Map<DimPos, Boolean> dropReachCache = new ConcurrentHashMap<>();
-    private static final Map<DimPos, Long> dropReachTime = new ConcurrentHashMap<>();
-    private static final long DROP_REACH_CACHE_MS = 15_000;
-
-    /**
-     * On roof with player below:
-     * 1) Dig soft cobble (always candidate)
-     * 2) Drop through open hatch ONLY if A* can walk from the landing to the player
-     */
-    private static boolean tryRoofDropToPlayer(Mob mob, Player target, CachedMobPath cached, boolean mobGriefing) {
-        if (target.getY() >= mob.getY() - 0.8) {
-            return false;
-        }
-        if (mob.distanceToSqr(target.getX(), mob.getY(), target.getZ()) > 14.0 * 14.0) {
-            return false;
-        }
-
         BlockPos feet = mob.blockPosition();
-        Level level = mob.level();
-        long tick = level.getGameTime();
-        BlockPos under = feet.below();
-        boolean overOpen = !isSolid(level, under);
-
-        // Throttle expensive hatch scans: every 5 ticks unless already over open air
-        if (!overOpen && mob.tickCount % 5 != 0) {
-            // Still dig soft cobble more often
-            return mobGriefing && tryBreakCeilingHatch(mob, target, cached);
-        }
-
-        // 1) Soft cobble under / near feet — dig BEFORE any drop (HatchDig)
-        if (mobGriefing && tryBreakCeilingHatch(mob, target, cached)) {
-            return true;
-        }
-
-        // 2) Standing over open floor — drop only if A* reaches player from below
-        if (overOpen) {
-            if (hatchReachesPlayer(mob, target, under)) {
-                forceDropThroughHatch(mob, under);
-                return true;
-            }
-            // One deeper check only (not 2–4 A*s)
-            BlockPos deeper = feet.below(2);
-            if (!isSolid(level, deeper) && hatchReachesPlayer(mob, target, deeper)) {
-                forceDropThroughHatch(mob, deeper);
-                return true;
-            }
-            if (ChallengeMod.isAStarDebugEnabled() && tick % 80 == 0) {
-                ChallengeMod.LOGGER.debug("[RoofDrop] mob={} skip drop {} — no A* path to player",
-                        mob.getUUID().toString().substring(0, 4), under);
-            }
-        }
-
-        // 3) Nearby verified hatch (budgeted A*) — only every 10 ticks when not over open
-        if (mob.tickCount % 10 == 0 || overOpen) {
-            BlockPos openHatch = findNearbyVerifiedHatch(mob, target, feet, 3);
-            if (openHatch != null) {
-                double dist = Math.sqrt(mob.position().distanceToSqr(
-                        openHatch.getX() + 0.5, mob.getY(), openHatch.getZ() + 0.5));
-                // Ignore absurdly far hatch picks (lag/wrong cell)
-                if (dist > 8.0) {
-                    return false;
-                }
-                if (dist > 0.55) {
-                    double speed = ChallengeMod.getSpeedMultiplier();
-                    mob.getNavigation().stop();
-                    mob.getMoveControl().setWantedPosition(openHatch.getX() + 0.5, mob.getY(),
-                            openHatch.getZ() + 0.5, speed);
-                    double dx = openHatch.getX() + 0.5 - mob.getX();
-                    double dz = openHatch.getZ() + 0.5 - mob.getZ();
-                    double len = Math.sqrt(dx * dx + dz * dz);
-                    if (len > 0.05) {
-                        dx /= len;
-                        dz /= len;
-                        mob.setDeltaMovement(dx * 0.26, Math.min(0, mob.getDeltaMovement().y), dz * 0.26);
-                    }
-                } else {
-                    forceDropThroughHatch(mob, openHatch);
-                }
-                if (ChallengeMod.isAStarDebugEnabled() && tick % 40 == 0) {
-                    ChallengeMod.LOGGER.debug("[RoofDrop] mob={} verified hatch {} dist={}",
-                            mob.getUUID().toString().substring(0, 4), openHatch, String.format("%.1f", dist));
-                }
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * True if dropping through {@code openCell} lands somewhere walk-A* can reach the player.
-     */
-    private static boolean hatchReachesPlayer(Mob mob, Player target, BlockPos openCell) {
-        if (openCell == null || target == null) {
-            return false;
-        }
-        Level level = mob.level();
-        BlockPos playerPos = target.blockPosition();
-        // Prefer a landing at/near player Y (inside the box), not a false roof ledge
-        BlockPos landing = findLandingBelowNearPlayer(level, openCell, playerPos, 12);
-        if (landing == null) {
+        if (landing.getY() >= feet.getY() || !level.isInWorldBounds(landing) || !level.hasChunkAt(landing)) {
             return false;
         }
 
-        DimPos key = new DimPos(level.dimension(), landing.immutable());
-        Long cachedAt = dropReachTime.get(key);
-        long now = System.currentTimeMillis();
-        if (cachedAt != null && now - cachedAt < DROP_REACH_CACHE_MS) {
-            return Boolean.TRUE.equals(dropReachCache.get(key));
-        }
-
-        // Same column + near player Y: drop is safe without A*
-        if (landing.getX() == playerPos.getX() && landing.getZ() == playerPos.getZ()
-                && Math.abs(landing.getY() - playerPos.getY()) <= 2) {
-            dropReachCache.put(key, true);
-            dropReachTime.put(key, now);
-            return true;
-        }
-
-        SharedFreeRoute free = sharedFreeRoute;
-        if (free != null && isFreeRouteUsable(level, free, playerPos)) {
-            for (BlockPos n : free.path) {
-                if (n.closerThan(landing, 2.5) || n.closerThan(openCell, 2.5)
-                        || n.equals(playerPos)) {
-                    dropReachCache.put(key, true);
-                    dropReachTime.put(key, now);
-                    return true;
-                }
-            }
-        }
-
-        // Hatch proofs share the global planner budget so they cannot stack with a full hunt plan.
-        if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK
-                || pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
-                || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
-            return false; // try later; cached movement continues meanwhile
-        }
-        hatchAstarsThisTick++;
-        pathCalcsPerTick++;
-
-        AStarPathfinder.PathResult walk = AStarPathfinder.findPath(mob, landing, playerPos, false, false, 0);
-        boolean ok = walk.found && walk.path != null && !walk.path.isEmpty();
-        if (ok) {
-            BlockPos end = walk.path.get(walk.path.size() - 1);
-            // Accept goal at player cell or A* found (adjacent goal) — append player for free route
-            ok = end.equals(playerPos) || walk.found;
-        }
-        // Same column as player and landing at player Y = definitely inside after drop
-        if (!ok && landing.getX() == playerPos.getX() && landing.getZ() == playerPos.getZ()
-                && Math.abs(landing.getY() - playerPos.getY()) <= 1) {
-            ok = true;
-        }
-        dropReachCache.put(key, ok);
-        dropReachTime.put(key, now);
-        if (ok) {
-            List<BlockPos> full = new ArrayList<>();
-            if (openCell.getY() > landing.getY()) {
-                full.add(openCell.immutable());
-            }
-            if (full.isEmpty() || !full.get(full.size() - 1).equals(landing)) {
-                full.add(landing.immutable());
-            }
-            if (walk.path != null) {
-                for (BlockPos n : walk.path) {
-                    if (full.isEmpty() || !full.get(full.size() - 1).equals(n)) {
-                        full.add(n);
-                    }
-                }
-            }
-            if (!full.get(full.size() - 1).equals(playerPos)) {
-                full.add(playerPos.immutable());
-            }
-            publishFreeRoute(level, full, playerPos);
-            if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.debug("[HatchOK] hatch={} landing={} → player nodes={}",
-                        openCell, landing, full.size());
-            }
-        }
-        return ok;
-    }
-
-    /**
-     * Find standable landing in the shaft, preferring near the player's Y (inside the fort).
-     */
-    private static BlockPos findLandingBelowNearPlayer(Level level, BlockPos openCell, BlockPos playerPos,
-            int maxDrop) {
-        BlockPos start = isSolid(level, openCell) ? openCell.below() : openCell;
-        BlockPos best = null;
-        int bestScore = Integer.MAX_VALUE;
-        for (int i = 0; i <= maxDrop; i++) {
-            BlockPos feet = start.below(i);
-            if (!level.isInWorldBounds(feet) || !level.hasChunkAt(feet)) {
+        // Clear only the vertical cells between this path node and its planned landing.
+        BlockPos blocked = null;
+        for (int y = feet.getY() - 1; y >= landing.getY(); y--) {
+            BlockPos cell = new BlockPos(feet.getX(), y, feet.getZ());
+            if (isSolid(level, cell)) {
+                blocked = cell;
                 break;
             }
-            if (isSolid(level, feet)) {
-                continue;
-            }
-            BlockPos floor = feet.below();
-            if (!isSolid(level, floor) && !level.getBlockState(floor).liquid()) {
-                continue;
-            }
-            if (isSolid(level, feet.above()) && i > 0) {
-                continue;
-            }
-            // Prefer landings at/near player height (not a 1-slab ledge still above the box)
-            int score = Math.abs(feet.getY() - playerPos.getY());
-            // Strongly prefer at or below player+1
-            if (feet.getY() > playerPos.getY() + 1) {
-                score += 20;
-            }
-            if (score < bestScore) {
-                bestScore = score;
-                best = feet.immutable();
-            }
         }
-        return best;
-    }
 
-    /** First standable feet cell in the shaft under an open hatch cell. */
-    private static BlockPos findLandingBelow(Level level, BlockPos openCell, int maxDrop) {
-        return findLandingBelowNearPlayer(level, openCell,
-                openCell.below(Math.min(maxDrop, 4)), maxDrop);
-    }
-
-    private static boolean pathEndsNearPlayer(List<BlockPos> path, BlockPos playerPos) {
-        if (path == null || path.isEmpty()) {
-            return false;
-        }
-        return path.get(path.size() - 1).closerThan(playerPos, 2.5);
-    }
-
-    /**
-     * Nearby open roof cell whose landing A* can reach the player.
-     * Collects air candidates, sorts by score, verifies at most a few with A*.
-     */
-    private static BlockPos findNearbyVerifiedHatch(Mob mob, Player target, BlockPos feet, int radius) {
-        Level level = mob.level();
-        BlockPos playerPos = target.blockPosition();
-        List<BlockPos> candidates = new ArrayList<>();
-
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                BlockPos floor = feet.offset(dx, -1, dz);
-                if (!isSolid(level, floor)) {
-                    candidates.add(floor.immutable());
+        if (blocked != null) {
+            if (!mobGriefing) {
+                return false;
+            }
+            float hardness = level.getBlockState(blocked).getDestroySpeed(level, blocked);
+            if (hardness < 0 || hardness > cached.maxBreakHardness) {
+                return false;
+            }
+            if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
+                MobBreakerHandler.tickBreaking(mob, blocked, cached.maxBreakHardness);
+                if (hardness <= 3.0f) {
+                    MobBreakerHandler.tickBreaking(mob, blocked, cached.maxBreakHardness);
                 }
+                cached.lastBreakTick = currentTick;
+                registerBreach(level, blocked);
             }
-        }
-        for (Map.Entry<DimPos, Long> e : openHoles.entrySet()) {
-            if (System.currentTimeMillis() - e.getValue() > OPEN_HOLE_EXPIRY_MS) {
-                continue;
-            }
-            if (!e.getKey().dimension().equals(level.dimension())) {
-                continue;
-            }
-            BlockPos p = e.getKey().pos();
-            if (p.distSqr(feet) > (long) (radius + 2) * (radius + 2)) {
-                continue;
-            }
-            if (!isSolid(level, p)) {
-                candidates.add(p.immutable());
-            }
+            mob.getNavigation().stop();
+            mob.getLookControl().setLookAt(blocked.getX() + 0.5, blocked.getY() + 0.5, blocked.getZ() + 0.5);
+            return true;
         }
 
-        candidates.sort((a, b) -> {
-            double sa = a.distSqr(feet) + a.distSqr(playerPos) * 0.15;
-            double sb = b.distSqr(feet) + b.distSqr(playerPos) * 0.15;
-            return Double.compare(sa, sb);
-        });
-
-        int checked = 0;
-        for (BlockPos floor : candidates) {
-            if (checked >= 3) {
-                break; // cap proofs per scan
-            }
-            if (hatchAstarsThisTick >= MAX_HATCH_ASTAR_PER_TICK
-                    || pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
-                    || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
-                // Prefer cache hits only
-                DimPos lk = new DimPos(mob.level().dimension(),
-                        Optional.ofNullable(findLandingBelowNearPlayer(mob.level(), floor, target.blockPosition(), 12))
-                                .orElse(floor).immutable());
-                Long t = dropReachTime.get(lk);
-                if (t != null && System.currentTimeMillis() - t < DROP_REACH_CACHE_MS
-                        && Boolean.TRUE.equals(dropReachCache.get(lk))) {
-                    return floor;
-                }
-                continue;
-            }
-            checked++;
-            if (hatchReachesPlayer(mob, target, floor)) {
-                return floor;
-            }
+        // A* selected a standable, non-dangerous landing. Center over the shaft and fall.
+        double nx = landing.getX() + 0.5;
+        double nz = landing.getZ() + 0.5;
+        double dx = nx - mob.getX();
+        double dz = nz - mob.getZ();
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal > 0.02) {
+            dx /= horizontal;
+            dz /= horizontal;
         }
-        return null;
+        double pull = horizontal > 0.35 ? 0.22 : 0.05;
+        mob.getNavigation().stop();
+        mob.getMoveControl().setWantedPosition(nx, landing.getY(), nz, ChallengeMod.getSpeedMultiplier());
+        mob.setNoGravity(false);
+        mob.setDeltaMovement(dx * pull, Math.min(mob.getDeltaMovement().y, -0.35), dz * pull);
+        return true;
     }
 
     private static boolean canStrategyBreak(Level level, BlockPos pos, float maxHardness) {
@@ -1684,75 +1320,6 @@ public class MobPathManager {
             }
         }
         return maxY;
-    }
-
-    /**
-     * Dig soft ceiling (cobble) under feet. Independent of Standard maxBreakH=0.
-     */
-    private static boolean tryBreakCeilingHatch(Mob mob, Player target, CachedMobPath cached) {
-        if (target.getY() >= mob.getY() - 0.5) {
-            return false;
-        }
-        if (mob.distanceToSqr(target.getX(), mob.getY(), target.getZ()) > 12.0 * 12.0) {
-            return false;
-        }
-
-        long tick = mob.level().getGameTime();
-        long lastBreak = cached != null ? cached.lastBreakTick : 0;
-        if (tick - lastBreak < BREAK_COOLDOWN_TICKS && cached != null) {
-            // Keep walking toward last dig so we don't freeze beside the hole
-            BlockPos feet = mob.blockPosition();
-            if (!isSolid(mob.level(), feet.below())) {
-                forceDropThroughHatch(mob, feet.below());
-                return true;
-            }
-            mob.getNavigation().stop();
-            return true;
-        }
-
-        BlockPos feet = mob.blockPosition();
-        // Prefer floor toward the player
-        int sdx = Integer.signum(target.getBlockX() - feet.getX());
-        int sdz = Integer.signum(target.getBlockZ() - feet.getZ());
-        BlockPos[] candidates = {
-                feet.below(),
-                feet.offset(sdx, -1, sdz),
-                feet.offset(sdx, -1, 0),
-                feet.offset(0, -1, sdz),
-                feet.below(2),
-                feet.north().below(), feet.south().below(), feet.east().below(), feet.west().below(),
-        };
-
-        for (BlockPos pos : candidates) {
-            if (tryBreakSoftCeiling(mob, pos, cached)) {
-                if (ChallengeMod.isAStarDebugEnabled() && tick % 20 == 0) {
-                    ChallengeMod.LOGGER.debug("[HatchDig] mob={} breaking ceiling {} (player below at y={})",
-                            mob.getUUID().toString().substring(0, 4), pos, (int) target.getY());
-                }
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean tryBreakSoftCeiling(Mob mob, BlockPos pos, CachedMobPath cached) {
-        if (!isSolid(mob.level(), pos)) {
-            return false;
-        }
-        float h = mob.level().getBlockState(pos).getDestroySpeed(mob.level(), pos);
-        if (h < 0 || h > 3.0f) {
-            return false;
-        }
-        MobBreakerHandler.tickBreaking(mob, pos, 3.0f);
-        MobBreakerHandler.tickBreaking(mob, pos, 3.0f);
-        if (cached != null) {
-            cached.lastBreakTick = mob.level().getGameTime();
-        }
-        mob.getLookControl().setLookAt(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-        // Nudge onto the dig cell so when it opens they fall
-        mob.getMoveControl().setWantedPosition(pos.getX() + 0.5, mob.getY(), pos.getZ() + 0.5,
-                ChallengeMod.getSpeedMultiplier());
-        return true;
     }
 
     /**
@@ -1882,8 +1449,6 @@ public class MobPathManager {
         activeBreachProgress.clear();
         activeBreachTime.clear();
         openHoles.clear();
-        dropReachCache.clear();
-        dropReachTime.clear();
         mobBreachGen.clear();
         breachGeneration = 0;
         sharedFreeRoute = null;
