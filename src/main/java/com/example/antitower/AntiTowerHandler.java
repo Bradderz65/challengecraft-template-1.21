@@ -3,7 +3,6 @@ package com.example.antitower;
 import com.example.ChallengeMod;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
@@ -69,11 +68,6 @@ public class AntiTowerHandler {
                 return;
             }
             removeBlockOwnership(world, pos);
-        });
-
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
-            UUID playerId = handler.player.getUUID();
-            clearPlayer(playerId);
         });
     }
 
@@ -178,7 +172,7 @@ public class AntiTowerHandler {
         placedBlocks.add(dimPos);
         blockOwners.put(dimPos, playerId);
 
-        ChallengeMod.LOGGER.info("[AntiTower] {} placed block at {}", player.getName().getString(), pos);
+        ChallengeMod.LOGGER.debug("[AntiTower] {} placed block at {}", player.getName().getString(), pos);
     }
 
     /**
@@ -209,30 +203,10 @@ public class AntiTowerHandler {
         level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
     }
 
-    /**
-     * Reset tracking for a player.
-     */
-    public static void resetPlayer(UUID playerId) {
-        clearPlayer(playerId);
-    }
-
-    /**
-     * Clear all tracking data.
-     */
     public static void clearAll() {
         playerPlacedBlocks.clear();
         blockOwners.clear();
         towerDetectedTime.clear();
-    }
-
-    private static void clearPlayer(UUID playerId) {
-        Set<DimPos> placed = playerPlacedBlocks.remove(playerId);
-        if (placed != null) {
-            for (DimPos pos : placed) {
-                blockOwners.remove(pos);
-            }
-        }
-        towerDetectedTime.remove(playerId);
     }
 
     private static void removeBlockOwnership(Level level, BlockPos pos) {

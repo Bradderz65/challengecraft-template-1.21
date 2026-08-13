@@ -1,6 +1,8 @@
 package com.example;
 
+import com.example.ai.MobPathManager;
 import com.example.antitower.AntiTowerHandler;
+import com.example.antitower.MobBreakerHandler;
 import com.example.config.ModConfig;
 import com.example.network.ConfigNetworking;
 import net.fabricmc.api.ModInitializer;
@@ -20,10 +22,6 @@ import org.slf4j.LoggerFactory;
 
 public class ChallengeMod implements ModInitializer {
 	public static final String MOD_ID = "challengecraft";
-
-	// This logger is used to write text to the console and the log file.
-	// It is considered best practice to use your mod id as the logger's name.
-	// That way, it's clear which mod wrote info, warnings, and errors.
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	public enum TargetMode {
@@ -55,6 +53,7 @@ public class ChallengeMod implements ModInitializer {
 	private static final int TPS_SAMPLE_SIZE = 20;
 	private static final long[] tickTimes = new long[TPS_SAMPLE_SIZE];
 	private static int tickTimeIndex = 0;
+	private static int tickTimeSamples = 0;
 	private static long lastTickTime = 0;
 	private static volatile double currentTps = 20.0;
 
@@ -130,7 +129,7 @@ public class ChallengeMod implements ModInitializer {
 	public static void setAStarEnabled(boolean enabled) {
 		aStarEnabled = enabled;
 		if (!enabled) {
-			com.example.ai.MobPathManager.clearAll();
+			MobPathManager.clearAll();
 		}
 	}
 
@@ -144,10 +143,6 @@ public class ChallengeMod implements ModInitializer {
 
 	@Override
 	public void onInitialize() {
-		// This code runs as soon as Minecraft is in a mod-load-ready state.
-		// However, some things (like resources) may still be uninitialized.
-		// Proceed with mild caution.
-
 		LOGGER.info("ChallengeMod initialized");
 
 		// Load config for dedicated server and singleplayer
@@ -159,23 +154,28 @@ public class ChallengeMod implements ModInitializer {
 
 		ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
 			if (entity instanceof net.minecraft.world.entity.Mob mob) {
-				com.example.ai.MobPathManager.onMobRemoved(mob);
+				MobPathManager.onMobRemoved(mob);
 			}
 		});
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
 			dispatcher.register(Commands.literal("fasttarget")
+					.requires(source -> source.hasPermission(2))
 					.executes(context -> setTargetMode(context.getSource(), TargetMode.FAST)));
 			dispatcher.register(Commands.literal("slowtarget")
+					.requires(source -> source.hasPermission(2))
 					.executes(context -> setTargetMode(context.getSource(), TargetMode.SLOW)));
 			dispatcher.register(Commands.literal("fast")
+					.requires(source -> source.hasPermission(2))
 					.then(Commands.literal("target")
 							.executes(context -> setTargetMode(context.getSource(), TargetMode.FAST))));
 			dispatcher.register(Commands.literal("slow")
+					.requires(source -> source.hasPermission(2))
 					.then(Commands.literal("target")
 							.executes(context -> setTargetMode(context.getSource(), TargetMode.SLOW))));
 
 			dispatcher.register(Commands.literal("startchallenge")
+					.requires(source -> source.hasPermission(2))
 					.then(Commands.argument("seconds", IntegerArgumentType.integer(0))
 							.executes(context -> startChallenge(context.getSource(),
 									IntegerArgumentType.getInteger(context, "seconds"), false))
@@ -183,13 +183,16 @@ public class ChallengeMod implements ModInitializer {
 									.executes(context -> startChallenge(context.getSource(),
 											IntegerArgumentType.getInteger(context, "seconds"), true)))));
 			dispatcher.register(Commands.literal("stopchallenge")
+					.requires(source -> source.hasPermission(2))
 					.executes(context -> stopChallenge(context.getSource(), false)));
 			dispatcher.register(Commands.literal("stop")
+					.requires(source -> source.hasPermission(2))
 					.then(Commands.argument("code", IntegerArgumentType.integer())
 							.executes(context -> stopChallenge(context.getSource(),
 									IntegerArgumentType.getInteger(context, "code") == STOP_CODE))));
 
 			dispatcher.register(Commands.literal("challenge")
+					.requires(source -> source.hasPermission(2))
 					.then(Commands.literal("speed")
 							.then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.1D))
 									.executes(context -> setSpeedMultiplier(context.getSource(),
@@ -207,17 +210,18 @@ public class ChallengeMod implements ModInitializer {
 			// Track TPS
 			long now = System.nanoTime();
 			if (lastTickTime != 0) {
-				long tickDuration = now - lastTickTime;
-				tickTimes[tickTimeIndex] = tickDuration;
+				tickTimes[tickTimeIndex] = now - lastTickTime;
 				tickTimeIndex = (tickTimeIndex + 1) % TPS_SAMPLE_SIZE;
+				if (tickTimeSamples < TPS_SAMPLE_SIZE) {
+					tickTimeSamples++;
+				}
 
-				// Calculate average TPS from samples
 				long totalTime = 0;
-				for (long time : tickTimes) {
-					totalTime += time;
+				for (int i = 0; i < tickTimeSamples; i++) {
+					totalTime += tickTimes[i];
 				}
 				if (totalTime > 0) {
-					double avgTickTimeMs = (totalTime / (double) TPS_SAMPLE_SIZE) / 1_000_000.0;
+					double avgTickTimeMs = (totalTime / (double) tickTimeSamples) / 1_000_000.0;
 					currentTps = Math.min(20.0, 1000.0 / avgTickTimeMs);
 				}
 			}
@@ -309,8 +313,8 @@ public class ChallengeMod implements ModInitializer {
 		ModConfig.setChallengeActive(false);
 		ModConfig.save();
 		AntiTowerHandler.clearAll();
-		com.example.ai.MobPathManager.clearAll();
-		com.example.antitower.MobBreakerHandler.clearAll();
+		MobPathManager.clearAll();
+		MobBreakerHandler.clearAll();
 	}
 
 	private static int setSpeedMultiplier(CommandSourceStack source, double multiplier) {

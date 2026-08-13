@@ -2,6 +2,7 @@ package com.example;
 
 import com.example.config.ModConfig;
 import com.example.network.ClientConfigNetworking;
+import com.example.render.PathDebugRenderer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -35,8 +36,7 @@ public class ChallengeModClient implements ClientModInitializer {
 		ClientConfigNetworking.register();
 		ModKeybinds.register();
 
-		// Register debug renderers
-		com.example.render.PathDebugRenderer.register();
+		PathDebugRenderer.register();
 
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
 			dispatcher.register(ClientCommandManager.literal("benchmark")

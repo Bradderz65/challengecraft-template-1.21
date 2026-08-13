@@ -1,7 +1,6 @@
 package com.example.mixin;
 
 import com.example.antitower.AntiTowerHandler;
-import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
@@ -20,15 +19,11 @@ public abstract class BlockItemMixin {
     @Inject(method = "place", at = @At("RETURN"))
     private void challengemod$onBlockPlaced(BlockPlaceContext context, CallbackInfoReturnable<InteractionResult> cir) {
         // Only track if placement was successful
-        InteractionResult result = cir.getReturnValue();
-        if (result != InteractionResult.SUCCESS &&
-                result != InteractionResult.CONSUME &&
-                result != InteractionResult.sidedSuccess(false) &&
-                result != InteractionResult.sidedSuccess(true)) {
+        if (context.getLevel().isClientSide) {
             return;
         }
-        // Only track server-side placements by players
-        if (context.getLevel().isClientSide) {
+        InteractionResult result = cir.getReturnValue();
+        if (result == null || !result.consumesAction()) {
             return;
         }
 
@@ -36,15 +31,8 @@ public abstract class BlockItemMixin {
             return;
         }
 
-        // Get the actual position where the block was placed
-        // This is the clicked position offset by the click face direction
-        BlockPos placedPos = context.getClickedPos().relative(context.getClickedFace());
-
-        // If clicking on a replaceable block (like grass), use clicked pos directly
-        if (context.getLevel().getBlockState(context.getClickedPos()).canBeReplaced(context)) {
-            placedPos = context.getClickedPos();
-        }
-
-        AntiTowerHandler.onBlockPlaced(serverPlayer, placedPos);
+        // BlockPlaceContext.getClickedPos() is already the placed cell
+        // (clicked block when replacing, or the neighbor in the clicked face otherwise).
+        AntiTowerHandler.onBlockPlaced(serverPlayer, context.getClickedPos());
     }
 }

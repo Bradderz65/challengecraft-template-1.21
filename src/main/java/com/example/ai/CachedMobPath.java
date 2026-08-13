@@ -75,7 +75,7 @@ public final class CachedMobPath {
             String buildInfo = next != null && buildActions.containsKey(next)
                     ? " (Needs Build at " + buildActions.get(next) + ")"
                     : "";
-            ChallengeMod.LOGGER.info("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}",
+            ChallengeMod.LOGGER.debug("[Stuck] Mob {} stuck at {} for {} ticks. Target node: {}{}",
                     mob.getUUID().toString().substring(0, 4), currentPos, stuckTicks, next, buildInfo);
         }
     }

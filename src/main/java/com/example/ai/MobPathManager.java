@@ -214,7 +214,7 @@ public class MobPathManager {
     public static void publishFreeRoute(Level level, List<BlockPos> path, BlockPos playerPos) {
         if (path == null || path.size() < MIN_SHARED_ROUTE_NODES) {
             if (ChallengeMod.isAStarDebugEnabled() && path != null) {
-                ChallengeMod.LOGGER.info("[FreeRoute] rejected nodes={} reason=too_short", path.size());
+                ChallengeMod.LOGGER.debug("[FreeRoute] rejected nodes={} reason=too_short", path.size());
             }
             return;
         }
@@ -250,7 +250,7 @@ public class MobPathManager {
         if (isNew) {
             bumpSwarmGeneration();
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info(
+                ChallengeMod.LOGGER.debug(
                         "[FreeRoute] published nodes={} entry={} end={} — ALL mobs funnel",
                         path.size(),
                         sharedFreeRoute.entryPos,
@@ -321,7 +321,7 @@ public class MobPathManager {
                 sharedFreeRoute = null;
                 bumpSwarmGeneration();
                 if (ChallengeMod.isAStarDebugEnabled()) {
-                    ChallengeMod.LOGGER.info(
+                    ChallengeMod.LOGGER.debug(
                             "[FreeRoute] invalidated reason=blocked_or_unloaded entry={} target={}",
                             free.entryPos, free.playerPos);
                 }
@@ -488,7 +488,7 @@ public class MobPathManager {
                 sharedFreeRoute = null;
                 free = null;
                 if (ChallengeMod.isAStarDebugEnabled()) {
-                    ChallengeMod.LOGGER.info("[FreeRoute] invalidated route target={} currentTarget={}",
+                    ChallengeMod.LOGGER.debug("[FreeRoute] invalidated route target={} currentTarget={}",
                             invalidTarget, targetPos);
                 }
             }
@@ -544,7 +544,7 @@ public class MobPathManager {
                     onFreeCorridor = true;
                     swarmRepath = false;
                     if (ChallengeMod.isAStarDebugEnabled()) {
-                        ChallengeMod.LOGGER.info(
+                        ChallengeMod.LOGGER.debug(
                                 "[FreeRoute] mob={} adopted nodes={} idx={} entry={}",
                                 mob.getUUID().toString().substring(0, 4),
                                 cached.path.size(),
@@ -689,7 +689,7 @@ public class MobPathManager {
                         if (ChallengeMod.isAStarDebugEnabled() && ChallengeMod.LOGGER.isDebugEnabled()
                                 && currentTick - cached.lastBuildLogTick >= BUILD_LOG_COOLDOWN_TICKS) {
                             cached.lastBuildLogTick = currentTick;
-                            ChallengeMod.LOGGER.info(
+                            ChallengeMod.LOGGER.debug(
                                     "[Path] mob={} strategy={} partial={} nodes={} maxY={} cost={} maxBreakH={} end={}",
                                     mob.getUUID().toString().substring(0, 4),
                                     strategy,
@@ -1058,7 +1058,7 @@ public class MobPathManager {
             if (!connector.found || connector.path == null || connector.path.isEmpty()) {
                 freeRouteRetryAfterTick.put(mob.getUUID(), currentTick + FREE_ROUTE_RETRY_TICKS);
                 if (ChallengeMod.isAStarDebugEnabled()) {
-                    ChallengeMod.LOGGER.info(
+                    ChallengeMod.LOGGER.debug(
                             "[FreeRoute] mob={} connector_failed from={} entry={} partial={} explored={}",
                             mob.getUUID().toString().substring(0, 4), mobPos, join,
                             connector.isPartial, connector.nodesExplored);
@@ -1066,7 +1066,7 @@ public class MobPathManager {
                 return null;
             }
             if (ChallengeMod.isAStarDebugEnabled()) {
-                ChallengeMod.LOGGER.info(
+                ChallengeMod.LOGGER.debug(
                         "[FreeRoute] mob={} connector_found from={} entry={} nodes={}",
                         mob.getUUID().toString().substring(0, 4), mobPos, join, connector.path.size());
             }

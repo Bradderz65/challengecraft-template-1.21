@@ -80,6 +80,7 @@ public class PathDebugRenderer {
             }
         }
 
+        bufferSource.endBatch(RenderType.lines());
         poseStack.popPose();
     }
 
@@ -131,9 +132,6 @@ public class PathDebugRenderer {
                     .setColor(color[0], color[1], color[2], color[3])
                     .setNormal(poseStack.last(), dx, dy, dz);
         }
-
-        // Flush the buffer
-        bufferSource.endBatch(RenderType.lines());
 
         // Render node markers
         for (int i = 0; i < path.size(); i++) {
@@ -197,8 +195,6 @@ public class PathDebugRenderer {
         drawLine(consumer, matrix, poseStack, x + half, y - half, z - half, x + half, y + half, z - half, color);
         drawLine(consumer, matrix, poseStack, x + half, y - half, z + half, x + half, y + half, z + half, color);
         drawLine(consumer, matrix, poseStack, x - half, y - half, z + half, x - half, y + half, z + half, color);
-
-        bufferSource.endBatch(RenderType.lines());
     }
 
     /**
@@ -288,7 +284,5 @@ public class PathDebugRenderer {
         drawLine(consumer, matrix, poseStack, maxX, minY, minZ, maxX, maxY, minZ, color);
         drawLine(consumer, matrix, poseStack, maxX, minY, maxZ, maxX, maxY, maxZ, color);
         drawLine(consumer, matrix, poseStack, minX, minY, maxZ, minX, maxY, maxZ, color);
-
-        bufferSource.endBatch(RenderType.lines());
     }
 }

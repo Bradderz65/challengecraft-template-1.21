@@ -1,5 +1,6 @@
 package com.example.ai;
 
+import com.example.ChallengeMod;
 import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
@@ -18,7 +19,7 @@ import net.minecraft.world.entity.player.Player;
 
 public final class HuntRules {
 	public static double getHuntRange() {
-		return com.example.ChallengeMod.getHuntRange();
+		return ChallengeMod.getHuntRange();
 	}
 
 	public static double getHuntRangeSquared() {
@@ -72,19 +73,7 @@ public final class HuntRules {
 	}
 
 	public static Player findClosestTarget(Mob mob) {
-		Player closest = null;
-		double huntRangeSquared = getHuntRangeSquared();
-		double closestDistance = huntRangeSquared;
-		for (Player player : mob.level().players()) {
-			if (!isValidPlayerTarget(player)) {
-				continue;
-			}
-			double distance = mob.distanceToSqr(player);
-			if (distance <= huntRangeSquared && distance < closestDistance) {
-				closest = player;
-				closestDistance = distance;
-			}
-		}
-		return closest;
+		return mob.level().getNearestPlayer(mob.getX(), mob.getY(), mob.getZ(), getHuntRange(),
+				entity -> entity instanceof Player player && isValidPlayerTarget(player));
 	}
 }

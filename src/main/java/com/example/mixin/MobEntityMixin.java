@@ -3,13 +3,22 @@ package com.example.mixin;
 import com.example.ChallengeMod;
 import com.example.ai.HuntMovement;
 import com.example.ai.HuntRules;
+import com.example.ai.MobBuilderHandler;
+import com.example.ai.MobPathManager;
+import com.example.antitower.MobBreakerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.ai.attributes.DefaultAttributes;
 import net.minecraft.world.entity.monster.AbstractSkeleton;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -20,16 +29,29 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Mob.class)
 public abstract class MobEntityMixin {
 	@Unique
+	private static final ResourceLocation HUNT_FOLLOW_RANGE = ResourceLocation.fromNamespaceAndPath(
+			ChallengeMod.MOD_ID, "hunt_follow_range");
+
+	@Unique
+	private static final int ELEVATED_BUILD_DELAY_TICKS = 40;
+
+	@Unique
 	private long lastPassiveAttackTick;
 
 	@Unique
 	private int retargetCooldown;
 
 	@Unique
-	private double originalFollowRange = Double.NaN;
+	private double appliedHuntRange = Double.NaN;
 
 	@Unique
-	private double appliedHuntRange = Double.NaN;
+	private double cachedVanillaFollowRange = Double.NaN;
+
+	@Unique
+	private Boolean challengeEligible;
+
+	@Unique
+	private int elevatedUnreachableTicks;
 
 	@Unique
 	private static final double WATER_SPEED_MULTIPLIER = 1.8D;
@@ -40,8 +62,7 @@ public abstract class MobEntityMixin {
 	@Inject(method = "registerGoals", at = @At("TAIL"))
 	private void challengemod$registerFollowRange(CallbackInfo info) {
 		Mob mob = (Mob) (Object) this;
-		boolean eligible = HuntRules.isEligibleMob(mob);
-		if (!eligible) {
+		if (mob.level().isClientSide || !isChallengeEligible(mob)) {
 			return;
 		}
 
@@ -52,17 +73,14 @@ public abstract class MobEntityMixin {
 	@SuppressWarnings("deprecation")
 	private void challengemod$forcePlayerTarget(CallbackInfo info) {
 		Mob mob = (Mob) (Object) this;
-		if (mob.level().isClientSide) {
-			return;
-		}
-		if (!HuntRules.isEligibleMob(mob)) {
-			return;
-		}
-		if (!ChallengeMod.isChallengeActive()) {
+		if (mob.level().isClientSide || !isChallengeEligible(mob)) {
 			return;
 		}
 
 		ensureHuntRange(mob);
+		if (!ChallengeMod.isChallengeActive()) {
+			return;
+		}
 
 		int interval = ChallengeMod.getTargetIntervalTicks();
 		if (interval > 1 && (mob.tickCount % interval) != 0) {
@@ -113,65 +131,50 @@ public abstract class MobEntityMixin {
 			return;
 		}
 
-		// Try A* pathfinding if enabled
-		boolean usingAStar = com.example.ai.MobPathManager.updatePathfinding(mob, target);
-		boolean pathFailed = com.example.ai.MobPathManager.isPathFailed(mob);
-		if (!usingAStar && pathFailed && com.example.ai.MobBuilderHandler.shouldBuild(mob, target.blockPosition(), true)) {
-			com.example.ai.MobBuilderHandler.startBuilding(mob, target.blockPosition());
+		boolean usingAStar = MobPathManager.updatePathfinding(mob, target);
+		var cachedPath = MobPathManager.getCachedPath(mob);
+		BlockPos targetBlock = target.blockPosition();
+		if (!usingAStar && target.getY() - mob.getY() > 2.0
+				&& (mob.getNavigation().isDone() || mob.getNavigation().isStuck())) {
+			this.elevatedUnreachableTicks += Math.max(1, interval);
+		} else {
+			this.elevatedUnreachableTicks = 0;
 		}
-		if (com.example.ai.MobBuilderHandler.isBuilding(mob)) {
-			if (com.example.ai.MobBuilderHandler.tickBuilding(mob, target.blockPosition())) {
-				return;
-			}
+		boolean cannotReachElevated = MobPathManager.isPathFailed(mob)
+				|| (!ChallengeMod.isAStarEnabled() && this.elevatedUnreachableTicks >= ELEVATED_BUILD_DELAY_TICKS);
+		if (!usingAStar && MobBuilderHandler.shouldBuild(mob, targetBlock, cannotReachElevated)) {
+			MobBuilderHandler.startBuilding(mob, targetBlock);
+		}
+		if (MobBuilderHandler.isBuilding(mob) && MobBuilderHandler.tickBuilding(mob, targetBlock)) {
+			return;
 		}
 
-		// Gap Jumping Logic:
-		// If the pathfinder found a path with a gap (next node is > 1.5 blocks away
-		// horizontally),
-		// we must initiate a jump to clear it.
-		if (usingAStar) {
-			var cachedPath = com.example.ai.MobPathManager.getCachedPath(mob);
-			if (cachedPath != null && !cachedPath.isComplete()) {
-				BlockPos nextNode = cachedPath.getNextNode();
-				if (nextNode != null) {
-					int mobBlockY = mob.blockPosition().getY();
-					int nextNodeY = nextNode.getY();
-					int nextDeltaY = nextNodeY - mobBlockY;
-					double dx = nextNode.getX() + 0.5 - mob.getX();
-					double dz = nextNode.getZ() + 0.5 - mob.getZ();
-					double distSqrHorizontal = dx * dx + dz * dz;
-					var landingState = mob.level().getBlockState(nextNode.below());
-					boolean hasLanding = landingState.blocksMotion() || landingState.liquid();
+		BlockPos mobBlockPos = mob.blockPosition();
+		if (usingAStar && cachedPath != null && !cachedPath.isComplete()) {
+			BlockPos nextNode = cachedPath.getNextNode();
+			if (nextNode != null) {
+				int nextDeltaY = nextNode.getY() - mobBlockPos.getY();
+				double dx = nextNode.getX() + 0.5 - mob.getX();
+				double dz = nextNode.getZ() + 0.5 - mob.getZ();
+				double distSqrHorizontal = dx * dx + dz * dz;
+				var landingState = mob.level().getBlockState(nextNode.below());
+				boolean hasLanding = landingState.blocksMotion() || landingState.liquid();
 
-					// Standard move is ~1 block distance (sqr ~ 1).
-					// Diagonal is ~1.41 (sqr ~ 2).
-					// Jump (2 blocks) is ~2.0 (sqr ~ 4).
-					// If distance > 2.25 (1.5 blocks), it's a gap jump.
-					// Also ensure we are facing it roughly? Or just force velocity.
-					if (distSqrHorizontal > 2.25 && nextDeltaY == 1 && hasLanding) {
-						boolean holeEnter = com.example.ai.MobPathManager.isEnterHolePhase(mob, nextNode);
-						// Enter-hole phase already owns velocity (assistClimbTo); do not gap-jump over it.
-						if (!holeEnter) {
-							mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
-									nextNode.getZ() + 0.5);
-							// Jump if on ground (and maybe slightly before edge?)
-							if (mob.onGround()) {
-								mob.getJumpControl().jump();
-								// Boost speed slightly
-								mob.setSprinting(true);
-								// Explicitly push towards target to ensure we clear the gap
-								Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
-								double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
-								if (currentSpeed < 0.18) {
-									mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.08)));
-								}
-							}
-						} else {
-							mob.setSprinting(false);
+				if (distSqrHorizontal > 2.25 && nextDeltaY == 1 && hasLanding
+						&& !MobPathManager.isEnterHolePhase(mob, nextNode)) {
+					mob.getLookControl().setLookAt(nextNode.getX() + 0.5, nextNode.getY() + 0.5,
+							nextNode.getZ() + 0.5);
+					if (mob.onGround()) {
+						mob.getJumpControl().jump();
+						mob.setSprinting(true);
+						Vec3 jumpDir = new Vec3(dx, 0, dz).normalize();
+						double currentSpeed = mob.getDeltaMovement().dot(jumpDir);
+						if (currentSpeed < 0.18) {
+							mob.setDeltaMovement(mob.getDeltaMovement().add(jumpDir.scale(0.08)));
 						}
-					} else {
-						mob.setSprinting(false);
 					}
+				} else {
+					mob.setSprinting(false);
 				}
 			}
 		}
@@ -193,36 +196,19 @@ public abstract class MobEntityMixin {
 		tryPassiveMelee(mob, target);
 
 		if (!usingAStar) {
-			com.example.antitower.MobBreakerHandler.handleMobBreaking(mob, target);
+			MobBreakerHandler.handleMobBreaking(mob, target);
 		}
 
-		// Spider-like climbing: if blocked by wall OR next to wall and target is above
-		// (or we need to maintain height to vault)
-		Vec3 wallAttraction = Vec3.ZERO;
-		BlockPos mobPos = mob.blockPosition();
-		if (mob.level().getBlockState(mobPos.north()).blocksMotion())
-			wallAttraction = wallAttraction.add(0, 0, -1);
-		if (mob.level().getBlockState(mobPos.south()).blocksMotion())
-			wallAttraction = wallAttraction.add(0, 0, 1);
-		if (mob.level().getBlockState(mobPos.east()).blocksMotion())
-			wallAttraction = wallAttraction.add(1, 0, 0);
-		if (mob.level().getBlockState(mobPos.west()).blocksMotion())
-			wallAttraction = wallAttraction.add(-1, 0, 0);
+		int wallBits = adjacentWallBits(mob.level(), mobBlockPos);
+		boolean isNextToWall = wallBits != 0;
 
-		boolean isNextToWall = wallAttraction.lengthSqr() > 0;
-
-		// Determine steering target (Path Node OR Player)
-		// We calculate this early to decide if we need to climb
 		Vec3 steeringTarget = target.position();
-		var cachedPath = com.example.ai.MobPathManager.getCachedPath(mob);
 		if (cachedPath != null && !cachedPath.isComplete()) {
 			BlockPos node = cachedPath.getNextNode();
 			if (node != null) {
 				BlockPos steeringNode = node;
-				// Pure vertical climb nodes have no horizontal direction. Look one node
-				// ahead so climbers can traverse sideways along the wall while ascending.
-				if (node.getX() == mob.blockPosition().getX()
-						&& node.getZ() == mob.blockPosition().getZ()
+				if (node.getX() == mobBlockPos.getX()
+						&& node.getZ() == mobBlockPos.getZ()
 						&& cachedPath.currentNodeIndex + 1 < cachedPath.path.size()) {
 					steeringNode = cachedPath.path.get(cachedPath.currentNodeIndex + 1);
 				}
@@ -230,7 +216,6 @@ public abstract class MobEntityMixin {
 			}
 		}
 
-		BlockPos mobBlockPos = mob.blockPosition();
 		int mobBlockY = mobBlockPos.getY();
 		int targetBlockY = (int) Math.floor(steeringTarget.y);
 		int targetDeltaY = targetBlockY - mobBlockY;
@@ -271,35 +256,30 @@ public abstract class MobEntityMixin {
 		// into the open cell. If this wall-climb block also writes velocity, the two
 		// fight every tick and the mob bounces forever at the lip. Skip it entirely.
 		boolean enterHoleActive = usingAStar && cachedPath != null && !cachedPath.isComplete()
-				&& com.example.ai.MobPathManager.isEnterHolePhase(mob, cachedPath.getNextNode());
+				&& MobPathManager.isEnterHolePhase(mob, cachedPath.getNextNode());
 
 		if (!enterHoleActive && !pathIsLateralDetour && (mob.horizontalCollision || isNextToWall)
 				&& (targetAbove || maintenanceHover)) {
 			Vec3 motion = mob.getDeltaMovement();
 			if (motion.y < 0.2) {
-				// "Wall Suction": Adjust steering target to be CLOSER to the wall, not center
-				// of air block.
-				// This prevents mobs from pulling themselves off the wall to reach the center
-				// of the air block.
-				Vec3 suctionVector = Vec3.ZERO;
-				BlockPos currentPos = mob.blockPosition();
-				if (mob.level().getBlockState(currentPos.north()).blocksMotion())
-					suctionVector = suctionVector.add(0, 0, -1);
-				if (mob.level().getBlockState(currentPos.south()).blocksMotion())
-					suctionVector = suctionVector.add(0, 0, 1);
-				if (mob.level().getBlockState(currentPos.east()).blocksMotion())
-					suctionVector = suctionVector.add(1, 0, 0);
-				if (mob.level().getBlockState(currentPos.west()).blocksMotion())
-					suctionVector = suctionVector.add(-1, 0, 0);
-
-				if (suctionVector.lengthSqr() > 0) {
-					suctionVector = suctionVector.normalize();
-					// Shift target 0.35 blocks towards the wall (result is 0.15 from edge, tight
-					// hug)
-					if (Math.abs(steeringTarget.y - mob.getY()) < 1.5) {
-						// If vaulting, don't hug wall as much, might need to clear lip
-					} else {
-						steeringTarget = steeringTarget.add(suctionVector.x * 0.35, 0, suctionVector.z * 0.35);
+				if (wallBits != 0 && Math.abs(steeringTarget.y - mob.getY()) >= 1.5) {
+					double sx = 0;
+					double sz = 0;
+					if ((wallBits & 1) != 0) {
+						sz -= 1;
+					}
+					if ((wallBits & 2) != 0) {
+						sz += 1;
+					}
+					if ((wallBits & 4) != 0) {
+						sx += 1;
+					}
+					if ((wallBits & 8) != 0) {
+						sx -= 1;
+					}
+					double suctionLen = Math.sqrt(sx * sx + sz * sz);
+					if (suctionLen > 0) {
+						steeringTarget = steeringTarget.add(sx / suctionLen * 0.35, 0, sz / suctionLen * 0.35);
 					}
 				}
 
@@ -381,15 +361,10 @@ public abstract class MobEntityMixin {
 
 		// Ceiling Breaker: climbing into a soft/medium block above — never netherite/obsidian
 		if (mob.verticalCollision && target.getY() > mob.getY()) {
-			float maxH = com.example.antitower.MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
-			var climbPath = com.example.ai.MobPathManager.getCachedPath(mob);
-			if (climbPath != null) {
-				maxH = climbPath.maxBreakHardness;
-			}
-			BlockPos headerPos = mob.blockPosition().above(2);
-			BlockPos directAbove = mob.blockPosition().above();
-			com.example.antitower.MobBreakerHandler.tickBreaking(mob, headerPos, maxH);
-			com.example.antitower.MobBreakerHandler.tickBreaking(mob, directAbove, maxH);
+			float maxH = cachedPath != null ? cachedPath.maxBreakHardness
+					: MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
+			MobBreakerHandler.tickBreaking(mob, mobBlockPos.above(2), maxH);
+			MobBreakerHandler.tickBreaking(mob, mobBlockPos.above(), maxH);
 		}
 
 		// Anti-Clumping / Pillar Chasing Logic / Smart Siege
@@ -437,19 +412,84 @@ public abstract class MobEntityMixin {
 	}
 
 	@Unique
+	private boolean isChallengeEligible(Mob mob) {
+		if (this.challengeEligible == null) {
+			this.challengeEligible = HuntRules.isEligibleMob(mob);
+		}
+		return this.challengeEligible;
+	}
+
+	@Unique
+	private static int adjacentWallBits(Level level, BlockPos pos) {
+		int bits = 0;
+		if (level.getBlockState(pos.north()).blocksMotion()) {
+			bits |= 1;
+		}
+		if (level.getBlockState(pos.south()).blocksMotion()) {
+			bits |= 2;
+		}
+		if (level.getBlockState(pos.east()).blocksMotion()) {
+			bits |= 4;
+		}
+		if (level.getBlockState(pos.west()).blocksMotion()) {
+			bits |= 8;
+		}
+		return bits;
+	}
+
+	@Unique
 	private void ensureHuntRange(Mob mob) {
 		AttributeInstance followRange = mob.getAttribute(Attributes.FOLLOW_RANGE);
 		if (followRange == null) {
 			return;
 		}
-		if (!Double.isFinite(this.originalFollowRange)) {
-			this.originalFollowRange = followRange.getBaseValue();
+
+		if (!Double.isFinite(this.cachedVanillaFollowRange)) {
+			this.cachedVanillaFollowRange = vanillaFollowRange(mob);
 		}
-		double desiredRange = Math.max(this.originalFollowRange, HuntRules.getHuntRange());
-		if (Double.compare(desiredRange, this.appliedHuntRange) != 0) {
-			followRange.setBaseValue(desiredRange);
+		double vanillaBase = this.cachedVanillaFollowRange;
+		if (Double.isFinite(vanillaBase)) {
+			double currentBase = followRange.getBaseValue();
+			if (currentBase > vanillaBase && currentBase >= 10.0 && currentBase <= 500.0
+					&& !followRange.hasModifier(HUNT_FOLLOW_RANGE)) {
+				followRange.setBaseValue(vanillaBase);
+			}
+		}
+
+		if (!ChallengeMod.isChallengeActive()) {
+			if (followRange.hasModifier(HUNT_FOLLOW_RANGE)) {
+				followRange.removeModifier(HUNT_FOLLOW_RANGE);
+			}
+			this.appliedHuntRange = Double.NaN;
+			return;
+		}
+
+		double desiredRange = Math.max(followRange.getBaseValue(), HuntRules.getHuntRange());
+		double bonus = desiredRange - followRange.getBaseValue();
+		if (bonus <= 0) {
+			followRange.removeModifier(HUNT_FOLLOW_RANGE);
+			this.appliedHuntRange = followRange.getBaseValue();
+			return;
+		}
+		if (Double.compare(desiredRange, this.appliedHuntRange) != 0 || !followRange.hasModifier(HUNT_FOLLOW_RANGE)) {
+			followRange.addOrUpdateTransientModifier(new AttributeModifier(
+					HUNT_FOLLOW_RANGE, bonus, AttributeModifier.Operation.ADD_VALUE));
 			this.appliedHuntRange = desiredRange;
 		}
+	}
+
+	@Unique
+	@SuppressWarnings("unchecked")
+	private static double vanillaFollowRange(Mob mob) {
+		EntityType<?> type = mob.getType();
+		if (!DefaultAttributes.hasSupplier(type)) {
+			return Double.NaN;
+		}
+		var supplier = DefaultAttributes.getSupplier((EntityType<? extends LivingEntity>) type);
+		if (!supplier.hasAttribute(Attributes.FOLLOW_RANGE)) {
+			return Double.NaN;
+		}
+		return supplier.getBaseValue(Attributes.FOLLOW_RANGE);
 	}
 
 	@Unique

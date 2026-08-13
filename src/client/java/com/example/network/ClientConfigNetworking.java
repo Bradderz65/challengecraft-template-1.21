@@ -1,5 +1,6 @@
 package com.example.network;
 
+import com.example.config.ModConfig;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 
 public final class ClientConfigNetworking {
@@ -28,7 +29,7 @@ public final class ClientConfigNetworking {
             ClientPlayNetworking.send(payload);
         } else {
             payload.apply();
-            com.example.config.ModConfig.save();
+            ModConfig.save();
         }
     }
 }
