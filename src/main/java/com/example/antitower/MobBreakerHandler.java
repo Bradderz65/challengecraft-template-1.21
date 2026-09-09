@@ -4,6 +4,7 @@ import com.example.ai.MobPathManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameRules;
@@ -22,7 +23,13 @@ public class MobBreakerHandler {
     }
 
     // Breaking progress is dimension-aware because identical coordinates can exist in every level.
-    private static final Map<DimPos, Float> blockDamage = new ConcurrentHashMap<>();
+    private record Damage(float amount, BlockState state, long lastTick,
+                          long windowStart, float windowDamage) {}
+
+    public static final int DIG_INTERVAL_TICKS = 10;
+    private static final Map<java.util.UUID, Long> lastMobDig = new ConcurrentHashMap<>();
+
+    private static final Map<DimPos, Damage> blockDamage = new ConcurrentHashMap<>();
 
     /** Obsidian / netherite-tier hardness. */
     public static final float ULTRA_HARD_THRESHOLD = 20.0f;
@@ -37,21 +44,22 @@ public class MobBreakerHandler {
     public static final float SWARM_FOCUS_DAMAGE = 0.35f;
 
     /**
-     * Estimated hits/ticks for A* dig cost. Mirrors {@link #damageBlock} rates so
+     * Estimated solo game ticks for A* dig cost. Mirrors {@link #damageBlock} rates so
      * planner and execution agree on which route is fastest.
      */
     public static double estimateTicksToBreak(float hardness) {
-        if (hardness < 0) {
-            return 100_000.0;
-        }
-        if (hardness <= 0) {
-            hardness = 0.05f;
-        }
-        // damage per hit: soft 0.12/h, hard 0.05/h  → ticks = 1 / damage
-        float damagePerHit = hardness <= 3.0f
-                ? (0.12f / Math.max(hardness, 0.2f))
-                : (0.05f / hardness);
-        return 1.0 / Math.max(damagePerHit, 0.0001f);
+        return hardness < 0 ? Double.POSITIVE_INFINITY : Math.max(40.0, hardness * 80.0);
+    }
+
+    /** One chip every half second: dirt ~2s, stone ~6s, cobble/wood ~8s at 20 TPS. */
+    public static float meleeDamage(float hardness) {
+        return (float) (DIG_INTERVAL_TICKS / estimateTicksToBreak(hardness));
+    }
+
+    /** Arrows chip only the impact block and cannot one-shot soft blocks. */
+    public static float arrowDamage(float hardness) {
+        return hardness < 0 || hardness >= ULTRA_HARD_THRESHOLD
+                ? 0f : Math.min(0.2f, 0.2f / Math.max(0.5f, hardness));
     }
 
     public static void handleMobBreaking(Mob mob, Player target) {
@@ -68,11 +76,7 @@ public class MobBreakerHandler {
         // Prefer finishing a nearly broken breach over random LOS digs
         BlockPos focus = findBestSwarmBreach(mob.level(), mob.blockPosition(), 12);
         if (focus != null && mob.blockPosition().closerThan(focus, 4.0)) {
-            // Extra chip on swarm holes so packs open faster
             tickBreaking(mob, focus, maxHardness);
-            if (getBlockDamage(mob.level(), focus) >= SWARM_FOCUS_DAMAGE) {
-                tickBreaking(mob, focus, maxHardness);
-            }
             return;
         }
 
@@ -113,6 +117,9 @@ public class MobBreakerHandler {
 
         if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
             return false;
+        if (!mob.level().hasChunkAt(pos) || mob.blockPosition().distSqr(pos) > 9.0) {
+            return false;
+        }
         BlockState state = mob.level().getBlockState(pos);
         if (state.isAir()) {
             blockDamage.remove(new DimPos(mob.level().dimension(), pos));
@@ -130,31 +137,45 @@ public class MobBreakerHandler {
     }
 
     public static void damageBlock(ServerLevel level, BlockPos pos, Mob breaker, float hardness) {
-        if (hardness < 0)
+        if (hardness < 0) {
             return;
-        if (hardness <= 0)
-            hardness = 0.05f;
-        // Soft blocks chip faster so hatches open under swarm pressure.
-        // Keep in sync with estimateTicksToBreak().
-        float damageAmount = hardness <= 3.0f ? (0.12f / Math.max(hardness, 0.2f)) : (0.05f / hardness);
-        // Extra 25% when already swarm-focused (multiple diggers finishing one hole)
-        DimPos key = new DimPos(level.dimension(), pos.immutable());
-        float existing = blockDamage.getOrDefault(key, 0f);
-        if (existing >= SWARM_FOCUS_DAMAGE) {
-            damageAmount *= 1.25f;
         }
-        applyDamage(level, pos, breaker, damageAmount);
+        long tick = level.getGameTime();
+        Long last = lastMobDig.get(breaker.getUUID());
+        if (last != null && tick - last < DIG_INTERVAL_TICKS) {
+            return;
+        }
+        lastMobDig.put(breaker.getUUID(), tick);
+        applyDamage(level, pos, breaker, meleeDamage(hardness));
     }
 
     public static void applyDamage(ServerLevel level, BlockPos pos, net.minecraft.world.entity.Entity breaker,
             float amount) {
         if (!level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
             return;
+        BlockState state = level.getBlockState(pos);
+        if (state.isAir() || state.getDestroySpeed(level, pos) < 0
+                || !Float.isFinite(amount) || amount <= 0) {
+            return;
+        }
         BlockPos blockPos = pos.immutable();
         DimPos key = new DimPos(level.dimension(), blockPos);
-        float currentDamage = blockDamage.getOrDefault(key, 0f);
-        currentDamage = Math.min(1.0f, currentDamage + amount);
-        blockDamage.put(key, currentDamage);
+        long tick = level.getGameTime();
+        Damage previous = blockDamage.get(key);
+        float currentDamage = getBlockDamage(level, pos);
+        boolean sameWindow = currentDamage > 0 && previous != null
+                && tick - previous.windowStart() < DIG_INTERVAL_TICKS;
+        long windowStart = sameWindow ? previous.windowStart() : tick;
+        float spent = sameWindow ? previous.windowDamage() : 0f;
+        // All melee and arrows share this per-block budget, including staggered mobs.
+        // Packs are at most twice as effective, and never remove over 25% per half-second.
+        float budget = Math.min(0.25f, 2 * meleeDamage(state.getDestroySpeed(level, pos)));
+        float accepted = Math.min(amount, Math.max(0f, budget - spent));
+        if (accepted <= 0f) {
+            return;
+        }
+        currentDamage = Math.min(1.0f, currentDamage + accepted);
+        blockDamage.put(key, new Damage(currentDamage, state, tick, windowStart, spent + accepted));
 
         // Swarm magnet: publish breach so A* routes everyone through this hole
         MobPathManager.registerActiveBreach(level, blockPos, currentDamage);
@@ -163,11 +184,14 @@ public class MobBreakerHandler {
         int breakId = 31 * level.dimension().hashCode() + blockPos.hashCode();
 
         if (currentDamage >= 1.0f) {
-            level.destroyBlock(blockPos, true, breaker);
+            boolean destroyed = level.destroyBlock(blockPos, true, breaker);
+            if (destroyed) {
+                AntiTowerHandler.removeBlockOwnership(level, blockPos);
+            }
             blockDamage.remove(key);
             level.destroyBlockProgress(breakId, blockPos, -1);
             // Funnel only if near a player (open hole that can lead to the hunt target)
-            if (level.getNearestPlayer(blockPos.getX() + 0.5, blockPos.getY() + 0.5, blockPos.getZ() + 0.5, 36.0, false) != null) {
+            if (destroyed && level.getNearestPlayer(blockPos.getX() + 0.5, blockPos.getY() + 0.5, blockPos.getZ() + 0.5, 36.0, false) != null) {
                 MobPathManager.registerOpenHole(level, blockPos);
             } else {
                 MobPathManager.clearBreach(level, blockPos);
@@ -178,7 +202,9 @@ public class MobBreakerHandler {
     }
 
     public static float getBlockDamage(Level level, BlockPos pos) {
-        return blockDamage.getOrDefault(new DimPos(level.dimension(), pos), 0f);
+        Damage damage = blockDamage.get(new DimPos(level.dimension(), pos));
+        return damage != null && level.getGameTime() - damage.lastTick() <= 300
+                && level.getBlockState(pos).equals(damage.state()) ? damage.amount() : 0f;
     }
 
     /**
@@ -188,20 +214,20 @@ public class MobBreakerHandler {
         BlockPos best = null;
         float bestScore = SWARM_FOCUS_DAMAGE; // minimum to consider
         int r2 = range * range;
-        for (Map.Entry<DimPos, Float> e : blockDamage.entrySet()) {
+        for (Map.Entry<DimPos, Damage> e : blockDamage.entrySet()) {
             if (!e.getKey().dimension().equals(level.dimension())) {
                 continue;
             }
-            float dmg = e.getValue();
+            float dmg = e.getValue().amount();
             if (dmg < SWARM_FOCUS_DAMAGE) {
                 continue;
             }
             BlockPos p = e.getKey().pos();
-            int dx = p.getX() - near.getX();
-            int dy = p.getY() - near.getY();
-            int dz = p.getZ() - near.getZ();
-            int dist2 = dx * dx + dy * dy + dz * dz;
+            double dist2 = p.distSqr(near);
             if (dist2 > r2) {
+                continue;
+            }
+            if (!level.hasChunkAt(p) || getBlockDamage(level, p) < SWARM_FOCUS_DAMAGE) {
                 continue;
             }
             // Prefer nearly broken, then closer
@@ -214,7 +240,31 @@ public class MobBreakerHandler {
         return best;
     }
 
+    /** Bound abandoned damage and clear the associated client crack animation. */
+    public static void cleanupExpiredDamage(MinecraftServer server) {
+        long tick = server.overworld().getGameTime();
+        lastMobDig.entrySet().removeIf(entry -> tick - entry.getValue() > 300);
+        blockDamage.entrySet().removeIf(entry -> {
+            ServerLevel level = server.getLevel(entry.getKey().dimension());
+            BlockPos pos = entry.getKey().pos();
+            if (level != null && level.hasChunkAt(pos)
+                    && getBlockDamage(level, pos) > 0) {
+                return false;
+            }
+            if (level != null) {
+                level.destroyBlockProgress(31 * level.dimension().hashCode() + pos.hashCode(), pos, -1);
+                MobPathManager.clearBreach(level, pos);
+            }
+            return true;
+        });
+    }
+
+    public static void onMobRemoved(Mob mob) {
+        lastMobDig.remove(mob.getUUID());
+    }
+
     public static void clearAll() {
+        lastMobDig.clear();
         blockDamage.clear();
     }
 }

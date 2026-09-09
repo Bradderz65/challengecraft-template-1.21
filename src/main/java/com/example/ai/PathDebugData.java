@@ -1,6 +1,7 @@
 package com.example.ai;
 
 import net.minecraft.core.BlockPos;
+import com.example.ChallengeMod;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,6 +26,9 @@ public class PathDebugData {
      * Set the path for a mob
      */
     public static void setMobPath(UUID mobId, List<BlockPos> path) {
+        if (!ChallengeMod.isAStarDebugEnabled()) {
+            return;
+        }
         if (path == null || path.isEmpty()) {
             removeMobPath(mobId);
             return;

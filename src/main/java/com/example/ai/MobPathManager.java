@@ -5,7 +5,6 @@ import com.example.antitower.MobBreakerHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.entity.Mob;
-import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
@@ -19,6 +18,72 @@ import java.util.concurrent.ConcurrentHashMap;
  * Caches paths and handles path following logic.
  */
 public class MobPathManager {
+
+    public enum PillarRouteStatus { FOUND, MISSING, DEFERRED }
+
+    /** A missing/partial/throttled navigation result alone never authorizes a pillar. */
+    public static PillarRouteStatus checkPillarRoute(Mob mob, BlockPos target) {
+        Level level = mob.level();
+        if (level.isClientSide || !level.isInWorldBounds(target) || !level.hasChunkAt(target)) {
+            HuntDiagnostics.decision(mob, "pillar_route", "target_unavailable");
+            return PillarRouteStatus.DEFERRED;
+        }
+        long tick = level.getGameTime();
+        if (hasKnownRoute(mob, target)) {
+            HuntDiagnostics.decision(mob, "pillar_route", "known_route");
+            return PillarRouteStatus.FOUND;
+        }
+        if (tick != lastTick) {
+            lastTick = tick;
+            pathCalcsPerTick = 0;
+            cleanupExpiredMetadata(tick);
+        }
+        if (pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK || ChallengeMod.getCurrentTps() < TPS_CUTOFF
+                || (MobBuilderHandler.hasPendingRouteCheck(tick) && !MobBuilderHandler.isBuilding(mob))) {
+            HuntDiagnostics.decision(mob, "pillar_route", ChallengeMod.getCurrentTps() < TPS_CUTOFF
+                    ? "low_tps" : pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
+                    ? "search_budget_used" : "other_builder_check_pending");
+            return PillarRouteStatus.DEFERRED;
+        }
+        pathCalcsPerTick++;
+        // Prove whether the existing terrain offers a walking/climbing route, without placing blocks.
+        AStarPathfinder.PathResult result = AStarPathfinder.findPath(mob, mob.blockPosition(), target,
+                false, false, 0);
+        HuntDiagnostics.search(mob, "pillar_route", result);
+        if (result.found) {
+            publishFreeRoute(level, result.path, target);
+            if (ChallengeMod.isAStarEnabled()) {
+                CachedMobPath route = new CachedMobPath(result.path, target, result.buildActions,
+                        "Standard", false);
+                route.lastRecalcTick = tick;
+                route.snapToNearestNode(mob);
+                pathCache.put(mob.getUUID(), route);
+            }
+            pathFailures.remove(mob.getUUID());
+            return PillarRouteStatus.FOUND;
+        }
+        // A partial route is unresolved, so continue investigating instead of adding a pillar.
+        return result.isPartial ? PillarRouteStatus.DEFERRED : PillarRouteStatus.MISSING;
+    }
+
+    /** Cheap priority check: use a known route without spending another search slot. */
+    public static boolean hasKnownRoute(Mob mob, BlockPos target) {
+        Level level = mob.level();
+        long tick = level.getGameTime();
+        CachedMobPath cached = getCachedPath(mob);
+        if (cached != null && !cached.partial && !cached.isExpired(tick) && !cached.isComplete()
+                && cached.targetPos.equals(target) && isUpcomingPathValid(level, cached)) {
+            return true;
+        }
+        if (isFreeRouteUsable(level, sharedFreeRoute, target)) {
+            return true;
+        }
+        var vanilla = mob.getNavigation().getPath();
+        if (vanilla != null && !vanilla.isDone() && vanilla.canReach() && vanilla.getTarget().equals(target)) {
+            return true;
+        }
+        return false;
+    }
 
     private record DimPos(ResourceKey<Level> dimension, BlockPos pos) {
     }
@@ -287,7 +352,7 @@ public class MobPathManager {
         }
 
         // Player cell must be standable (not solid filled)
-        if (isSolid(level, playerPos) && isSolid(level, playerPos.above())) {
+        if (isSolid(level, playerPos) || isSolid(level, playerPos.above())) {
             return false;
         }
 
@@ -306,10 +371,7 @@ public class MobPathManager {
         // The endpoint itself remains the corridor anchor; direct navigation handles
         // the short final approach to the player's current cell.
         if (!free.playerPos.closerThan(playerPos, FREE_ROUTE_TARGET_RADIUS)) {
-            if (sharedFreeRoute == free) {
-                sharedFreeRoute = null;
-                bumpSwarmGeneration();
-            }
+            // This mob may be hunting another player. Keep the corridor for its users.
             return false;
         }
         if (!isValidFreeRoute(level, free.path, free.playerPos)) {
@@ -345,6 +407,11 @@ public class MobPathManager {
     }
 
     public static float getBreachProgress(Level level, BlockPos pos) {
+        // Damage tracking validates both the current block state and its age.
+        // Old open-hole metadata must not make a replacement wall nearly free to dig.
+        if (level.getBlockState(pos).blocksMotion()) {
+            return MobBreakerHandler.getBlockDamage(level, pos);
+        }
         if (isOpenHole(level, pos)) {
             return 1.0f; // already air — free corridor in A*
         }
@@ -415,7 +482,12 @@ public class MobPathManager {
         });
         openHoles.entrySet().removeIf(entry -> now - entry.getValue() > OPEN_HOLE_EXPIRY_MS);
         mobPlacedBlocks.entrySet().removeIf(entry -> now - entry.getValue() > MOB_PLACED_BLOCK_EXPIRY_MS);
-        pathFailures.entrySet().removeIf(entry -> now - entry.getValue() > 5_000);
+        pathFailures.entrySet().removeIf(entry -> currentTick - entry.getValue() > 100);
+    }
+
+    static boolean isWithinPlanningRange(double distanceSquared, double horizontalDistanceSquared) {
+        return distanceSquared <= MAX_ASTAR_DISTANCE * MAX_ASTAR_DISTANCE
+                || horizontalDistanceSquared <= MAX_ASTAR_HORIZONTAL_DISTANCE * MAX_ASTAR_HORIZONTAL_DISTANCE;
     }
 
     /**
@@ -453,19 +525,26 @@ public class MobPathManager {
         }
 
         // For very long ranges, don't use A*
-        if (distance > MAX_ASTAR_DISTANCE
-                && horizontalDistSqr > (MAX_ASTAR_HORIZONTAL_DISTANCE * MAX_ASTAR_HORIZONTAL_DISTANCE)) {
+        if (!isWithinPlanningRange(distance * distance, horizontalDistSqr)) {
             clearMobState(mob);
             return false;
         }
 
         CachedMobPath cached = pathCache.get(mob.getUUID());
+        if (cached != null && (cached.hasFallenBehind(mob) || cached.hasClimbedPast(mob))) {
+            HuntDiagnostics.decision(mob, "path", "height_departed_from_route");
+            clearMobState(mob);
+            mob.getNavigation().stop();
+            cached = null;
+        }
         BlockPos targetPos = target.blockPosition();
         boolean buildingActive = cached != null && "Building".equals(cached.strategy)
                 && !cached.isExpired(currentTick) && !cached.isComplete();
 
         // Low TPS / slot limit: still FOLLOW existing paths (and dig roof), just don't replan
         boolean allowNewPathCalc = ChallengeMod.getCurrentTps() >= TPS_CUTOFF
+                && mob.tickCount % ChallengeMod.getTargetIntervalTicks() == 0
+                && !MobBuilderHandler.hasPendingRouteCheck(currentTick)
                 && pathCalcsPerTick < MAX_PATH_CALCS_PER_TICK;
 
         // Swarm / free-route generation → unlock so the pack funnels through open paths
@@ -481,8 +560,7 @@ public class MobPathManager {
         if (!freeAvailable && free != null) {
             // Drop invalid routes so dig / SoftBreak can run again.
             if (free.dimension.equals(mob.level().dimension())
-                    && (!free.playerPos.closerThan(targetPos, FREE_ROUTE_TARGET_RADIUS)
-                    || !isValidFreeRoute(mob.level(), free.path, free.playerPos)
+                    && (!isValidFreeRoute(mob.level(), free.path, free.playerPos)
                     || !isSharedRouteStillOpenCached(mob.level(), free))) {
                 BlockPos invalidTarget = free.playerPos;
                 sharedFreeRoute = null;
@@ -493,11 +571,16 @@ public class MobPathManager {
                 }
             }
         }
-        // A cached shared path is meaningful only while its exact authoritative route exists.
+        // A publication changing does not make a mob's still-open climb unusable.
         if (!freeAvailable && cached != null && cached.sharedRouteId >= 0) {
-            pathCache.remove(mob.getUUID());
-            removeDebugPath(mob);
-            cached = null;
+            if (canContinueRoute(mob.level(), cached, targetPos)) {
+                cached.sharedRouteId = -1;
+                cached.lastRecalcTick = currentTick;
+            } else {
+                pathCache.remove(mob.getUUID());
+                removeDebugPath(mob);
+                cached = null;
+            }
         }
 
         boolean onFreeCorridor = false;
@@ -506,7 +589,9 @@ public class MobPathManager {
             boolean completedThisRoute = completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id;
             boolean hasThisSharedRoute = cached != null && cached.sharedRouteId == free.id;
             boolean finishedSharedRoute = hasThisSharedRoute && cached.isComplete();
-            boolean alreadyOnFree = hasThisSharedRoute && !cached.isComplete();
+            boolean alreadyOnFree = (hasThisSharedRoute && !cached.isComplete())
+                    || (cached != null && !hasThisSharedRoute
+                    && "Standard".equals(cached.strategy) && canContinueRoute(mob.level(), cached, targetPos));
 
             // A stuck connector may be rebuilt, but it must never fall through to an
             // independent player path while this shared route remains valid.
@@ -572,8 +657,7 @@ public class MobPathManager {
         // On a free corridor, only replan if stuck/invalid. A completed shared route
         // deliberately hands off to vanilla navigation instead of starting another A*.
         boolean localFinalApproach = freeAvailable && cached == null
-                && (completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id
-                || currentTick < freeRouteRetryAfterTick.getOrDefault(mob.getUUID(), Long.MIN_VALUE));
+                && completedSharedRoute.getOrDefault(mob.getUUID(), -1L) == free.id;
         boolean needsRecalculation = !onFreeCorridor && !localFinalApproach && (cached == null
                 || cached.isExpired(currentTick)
                 || cached.isComplete()
@@ -606,7 +690,7 @@ public class MobPathManager {
         // allowed to replace the mob's path; if a connector is throttled or fails, keep
         // following the existing path and retry later instead of generating a competing
         // partial route to the player.
-        if (freeAvailable) {
+        if (freeAvailable && cached != null && !cached.isStuckLong()) {
             needsRecalculation = false;
             swarmRepath = false;
         }
@@ -634,6 +718,18 @@ public class MobPathManager {
             needsRecalculation = false;
         }
 
+        // A failed mob must yield search slots so other mobs can plan.
+        if (cached == null && isPathFailed(mob)) {
+            if (mob.tickCount % 100 == 0) HuntDiagnostics.decision(mob, "path", "failure_cooldown");
+            return false;
+        }
+
+        if (needsRecalculation && !allowNewPathCalc && mob.tickCount % 100 == 0) {
+            HuntDiagnostics.decision(mob, "path", ChallengeMod.getCurrentTps() < TPS_CUTOFF
+                    ? "low_tps" : MobBuilderHandler.hasPendingRouteCheck(currentTick)
+                    ? "builder_check_pending" : "search_budget_used");
+        }
+
         if (needsRecalculation && allowNewPathCalc) {
             if (pathCalcsPerTick < MAX_PATH_CALCS_PER_TICK) {
                 if (cached == null || stuckReplan || swarmRepath || freeAvailable
@@ -646,7 +742,7 @@ public class MobPathManager {
                     String strategy;
                     pathCalcsPerTick++;
 
-                    if (mobGriefing) {
+                    if (mobGriefing && !freeAvailable) {
                         // Smart graph only: break/build edge costs pick the best plan
                         result = AStarPathfinder.findPath(mob, start, targetPos, true, true, Float.MAX_VALUE);
                         strategy = result.usable() ? classifyPath(mob.level(), result) : "Standard";
@@ -672,6 +768,7 @@ public class MobPathManager {
                         }
                     }
 
+                    HuntDiagnostics.search(mob, "pursuit", result);
                     if (result.usable()) {
                         CachedMobPath previous = cached;
                         cached = new CachedMobPath(result.path, targetPos, result.buildActions, strategy, result.isPartial);
@@ -712,7 +809,7 @@ public class MobPathManager {
                                     && canStrategyBreak(mob.level(), node.above(), cached.maxBreakHardness)) {
                                 registerBreach(mob.level(), node.above());
                             }
-                            if (i + 1 < p.size() && p.get(i + 1).getY() < node.getY()) {
+                            if (i + 1 < p.size() && isVerticalDrop(node, p.get(i + 1))) {
                                 int drop = node.getY() - p.get(i + 1).getY();
                                 for (int d = 1; d <= drop; d++) {
                                     BlockPos floor = node.below(d);
@@ -737,14 +834,14 @@ public class MobPathManager {
                         pathCache.remove(mob.getUUID());
                         removeDebugPath(mob);
                         BuildPlanData.removeBuildPlan(mob.getUUID());
-                        pathFailures.put(mob.getUUID(), System.currentTimeMillis());
+                        pathFailures.put(mob.getUUID(), currentTick);
                         return false;
                     }
                 }
             }
 
             if (cached == null) {
-                pathFailures.put(mob.getUUID(), System.currentTimeMillis());
+                pathFailures.put(mob.getUUID(), currentTick);
                 return false;
             }
         }
@@ -756,7 +853,7 @@ public class MobPathManager {
             BlockPos nextNode = cached.getNextNode();
 
             // Keep debug overlays alive and trimmed to remaining path while following
-            if (mob.tickCount % 10 == 0) {
+            if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 10 == 0) {
                 List<BlockPos> remaining = cached.remainingPath();
                 if (!remaining.isEmpty()) {
                     publishDebugPath(mob, remaining);
@@ -793,8 +890,9 @@ public class MobPathManager {
                                  mob.getNavigation().stop();
                                  return true;
                              }
-                              mob.level().setBlock(buildTarget, net.minecraft.world.level.block.Blocks.COBBLESTONE.defaultBlockState(), 3);
-                              registerMobPlacedBlock(mob.level(), buildTarget);
+                              if (!MobBuilderHandler.tryPlaceScaffold(mob, buildTarget)) {
+                                  return true;
+                              }
                               cached.lastBuildTick = currentTick;
                               cached.placeDelay = 30;
                               return true;
@@ -831,36 +929,7 @@ public class MobPathManager {
                 }
 
                 if (nextNode != null) {
-                    // Swarm focus: nearly-broken solid only (don't freeze on air / finished digs)
-                    BlockPos swarmHole = MobBreakerHandler.findBestSwarmBreach(mob.level(), mob.blockPosition(), 10);
-                    float swarmDmg = swarmHole != null ? MobBreakerHandler.getBlockDamage(mob.level(), swarmHole) : 0f;
-                    if (swarmHole != null && isSolid(mob.level(), swarmHole)
-                            && swarmDmg >= MobBreakerHandler.SWARM_FOCUS_DAMAGE
-                            && mob.blockPosition().closerThan(swarmHole, 4.5)) {
-                        float h = mob.level().getBlockState(swarmHole).getDestroySpeed(mob.level(), swarmHole);
-                        if (h >= 0 && (h <= cached.maxBreakHardness || swarmDmg >= MobBreakerHandler.SWARM_FOCUS_DAMAGE)) {
-                            if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
-                                float breakCap = Math.max(cached.maxBreakHardness,
-                                        h <= 3.0f ? 3.0f : (h <= 10.0f ? 10.0f : Float.MAX_VALUE));
-                                MobBreakerHandler.tickBreaking(mob, swarmHole, breakCap);
-                                MobBreakerHandler.tickBreaking(mob, swarmHole, breakCap);
-                                cached.lastBreakTick = currentTick;
-                                registerBreach(mob.level(), swarmHole);
-                                if (ChallengeMod.isAStarDebugEnabled() && currentTick % 20 == 0) {
-                                    ChallengeMod.LOGGER.debug(
-                                            "[SwarmDig] mob={} focus {} dmg={}",
-                                            mob.getUUID().toString().substring(0, 4), swarmHole,
-                                            String.format("%.2f", MobBreakerHandler.getBlockDamage(mob.level(), swarmHole)));
-                                }
-                            }
-                            mob.getLookControl().setLookAt(swarmHole.getX() + 0.5, swarmHole.getY() + 0.5,
-                                    swarmHole.getZ() + 0.5);
-                            // Approach + climb into the breach, don't just stop
-                            double speed = ChallengeMod.getSpeedMultiplier();
-                            assistClimbTo(mob, swarmHole, speed, cached);
-                            return true;
-                        }
-                    }
+                    // Follow the selected route; unrelated damaged blocks are not destinations.
 
                     // Downward transitions are already proven by A*. Execute that exact
                     // shaft instead of running separate hatch scans and verification searches.
@@ -876,9 +945,6 @@ public class MobPathManager {
                         if (h >= 0 && h <= cached.maxBreakHardness) {
                             if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
                                 MobBreakerHandler.tickBreaking(mob, nextNode, cached.maxBreakHardness);
-                                if (h <= 3.0f) {
-                                    MobBreakerHandler.tickBreaking(mob, nextNode, cached.maxBreakHardness);
-                                }
                                 cached.lastBreakTick = currentTick;
                                 registerBreach(mob.level(), nextNode);
                             }
@@ -892,9 +958,6 @@ public class MobPathManager {
                         if (h >= 0 && h <= cached.maxBreakHardness) {
                             if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
                                 MobBreakerHandler.tickBreaking(mob, nextNode.above(), cached.maxBreakHardness);
-                                if (h <= 3.0f) {
-                                    MobBreakerHandler.tickBreaking(mob, nextNode.above(), cached.maxBreakHardness);
-                                }
                                 cached.lastBreakTick = currentTick;
                                 registerBreach(mob.level(), nextNode.above());
                             }
@@ -938,7 +1001,7 @@ public class MobPathManager {
         if (lastFailure == null) {
             return false;
         }
-        return System.currentTimeMillis() - lastFailure < 5000;
+        return mob.level().getGameTime() - lastFailure < 100;
     }
 
     private static boolean isSolid(Level level, BlockPos pos) {
@@ -990,7 +1053,7 @@ public class MobPathManager {
         return bestLocal >= 0 ? bestLocal : entryIndex;
     }
 
-    /** A snap is safe only for a normal adjacent walk/step with clear body space. */
+    /** Use the same local walk/climb edges as the planner, including midair wall joins. */
     private static boolean hasDirectLocalJoin(Level level, BlockPos from, BlockPos to) {
         int dx = Math.abs(to.getX() - from.getX());
         int dz = Math.abs(to.getZ() - from.getZ());
@@ -1001,19 +1064,7 @@ public class MobPathManager {
         if (isSolid(level, to) || isSolid(level, to.above())) {
             return false;
         }
-        BlockState floor = level.getBlockState(to.below());
-        if (!floor.blocksMotion() && !floor.liquid()) {
-            return false;
-        }
-        if (dx == 1 && dz == 1) {
-            BlockPos sideX = from.offset(to.getX() - from.getX(), 0, 0);
-            BlockPos sideZ = from.offset(0, 0, to.getZ() - from.getZ());
-            if (isSolid(level, sideX) || isSolid(level, sideX.above())
-                    || isSolid(level, sideZ) || isSolid(level, sideZ.above())) {
-                return false;
-            }
-        }
-        return true;
+        return AStarPathfinder.isValidMove(level, from, to, false, 0);
     }
 
     /**
@@ -1045,6 +1096,7 @@ public class MobPathManager {
             // traversable connector to it. Connector searches share the same global
             // one-search-per-tick budget as ordinary A* planning.
             if (pathCalcsPerTick >= MAX_PATH_CALCS_PER_TICK
+                    || MobBuilderHandler.hasPendingRouteCheck(currentTick)
                     || ChallengeMod.getCurrentTps() < TPS_CUTOFF) {
                 return null;
             }
@@ -1121,18 +1173,13 @@ public class MobPathManager {
             return false;
         }
         List<BlockPos> path = free.path;
-        BlockPos end = path.get(path.size() - 1);
         // Validate every node: one sealed, unloaded, or changed cell invalidates the route.
-        for (int i = 0; i < path.size() - 1; i++) {
+        for (int i = 0; i < path.size(); i++) {
             BlockPos n = path.get(i);
             if (!level.isInWorldBounds(n) || !level.hasChunkAt(n)
                     || isSolid(level, n) || isSolid(level, n.above())) {
                 return false;
             }
-        }
-        // Last node: allow player cell; reject if end is solid and not just path end marker
-        if (path.size() > 1 && isSolid(level, end) && isSolid(level, end.above())) {
-            return false;
         }
         return true;
     }
@@ -1150,258 +1197,30 @@ public class MobPathManager {
      * Arrived only if close in XZ and roughly at the same Y. Climb/step-up nodes
      * must not be skipped while still standing below the hole.
      */
-    private static boolean hasArrivedAtNode(Mob mob, BlockPos node) {
-        double dx = mob.getX() - (node.getX() + 0.5);
-        double dz = mob.getZ() - (node.getZ() + 0.5);
+    static boolean hasArrivedAtNode(Mob mob, BlockPos node) {
+        var destination = HuntMovement.nodePosition(mob, node);
+        double dx = mob.getX() - destination.x;
+        double dz = mob.getZ() - destination.z;
         double horiz = dx * dx + dz * dz;
         double dy = mob.getY() - node.getY();
-        // Inside hole cell: looser vertical once horizontally in the opening
-        if (horiz < 0.55 && Math.abs(dy) < 1.15) {
-            return true;
-        }
-        // Normal: within ~1.1 blocks horizontal and ~0.7 vertical of the node feet
-        return horiz < 1.25 && Math.abs(dy) < 0.75;
+        // Adjacent or vertically aligned nodes still need to be reached physically.
+        // Do not advance a climb while the mob's feet are still below the ledge.
+        return horiz < 0.04 && dy >= -0.001 && dy < 0.6;
     }
 
-    // Enter-hole phase bounds — shared by assistClimbTo and MobEntityMixin so the
-    // velocity-ownership handoff never drifts apart when tuned.
-    private static final double ENTER_HOLE_MAX_UP = 1.85;
-    private static final double ENTER_HOLE_MIN_UP = -0.6;
-    private static final double ENTER_HOLE_MAX_HORIZ = 2.5;
-
-    /**
-     * True when the mob is close enough to an open path cell that assistClimbTo owns
-     * velocity (ENTER phase). Other steering (wall climb, gap jump) must yield.
-     */
-    public static boolean isEnterHolePhase(Mob mob, BlockPos node) {
-        if (node == null) {
-            return false;
-        }
-        Level level = mob.level();
-        if (isSolid(level, node)) {
-            return false;
-        }
-        if (isSolid(level, node.above())) {
-            CachedMobPath cached = getCachedPath(mob);
-            if (cached == null || !canStrategyBreak(level, node.above(), cached.maxBreakHardness)) {
-                return false;
-            }
-        }
-        double needUp = node.getY() - mob.getY();
-        double dx = node.getX() + 0.5 - mob.getX();
-        double dz = node.getZ() + 0.5 - mob.getZ();
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        return needUp < ENTER_HOLE_MAX_UP && needUp > ENTER_HOLE_MIN_UP && horiz < ENTER_HOLE_MAX_HORIZ;
+    static boolean canContinueRoute(Level level, CachedMobPath cached, BlockPos target) {
+        BlockPos end = cached.getFinalNode();
+        return !cached.partial && !cached.isComplete() && !cached.isStuckLong()
+                && end != null && end.closerThan(target, 3.5) && isUpcomingPathValid(level, cached);
     }
 
-    /** Horizontal assistance cap based on the mob's own vanilla movement attribute. */
-    private static double assistedHorizontalSpeed(Mob mob, double multiplier, double minimum, double maximum) {
-        double base = mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
-        return Math.clamp(base * multiplier, minimum, maximum);
-    }
-
-    private static void setAssistedVelocity(Mob mob, double x, double y, double z, double horizontalCap) {
-        double horizontal = Math.sqrt(x * x + z * z);
-        if (horizontal > horizontalCap && horizontal > 1.0E-7) {
-            double scale = horizontalCap / horizontal;
-            x *= scale;
-            z *= scale;
-        }
-        mob.setDeltaMovement(x, y, z);
-    }
-
-    /**
-     * Move toward a path node. Ordinary travel stays vanilla; direct velocity is reserved
-     * for climbing and entering openings that vanilla navigation cannot execute.
-     */
+    /** Path nodes use the same movement speed as ordinary pursuit. */
     private static void assistClimbTo(Mob mob, BlockPos node, double speed, CachedMobPath cached) {
-        Level level = mob.level();
-        double nx = node.getX() + 0.5;
-        double ny = node.getY();
-        double nz = node.getZ() + 0.5;
-        double needUp = ny - mob.getY();
-
-        double dx = nx - mob.getX();
-        double dz = nz - mob.getZ();
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        if (horiz > 0.05) {
-            dx /= horiz;
-            dz /= horiz;
-        } else if (cached != null && node.getY() > mob.getY()) {
-            // A vertical node has no horizontal steering vector. While climbing,
-            // bias toward the next route segment (or final target) so mobs can move
-            // sideways along a wall instead of freezing in one vertical column.
-            BlockPos horizontalGoal = cached.targetPos;
-            int followingIndex = cached.currentNodeIndex + 1;
-            if (followingIndex < cached.path.size()) {
-                horizontalGoal = cached.path.get(followingIndex);
-            }
-            dx = horizontalGoal.getX() + 0.5 - mob.getX();
-            dz = horizontalGoal.getZ() + 0.5 - mob.getZ();
-            double steeringLength = Math.sqrt(dx * dx + dz * dz);
-            if (steeringLength > 0.05) {
-                dx /= steeringLength;
-                dz /= steeringLength;
-            } else {
-                dx = 0;
-                dz = 0;
-            }
-        } else {
-            dx = 0;
-            dz = 0;
-        }
-
-        // Near target height and hole is open → ENTER (no bounce-jump)
-        boolean enterPhase = isEnterHolePhase(mob, node);
-
-        if (enterPhase) {
-            // Stop vanilla nav and move control (they recompute velocity later in
-            // aiStep and fight the direct push). We own the velocity this phase.
-            mob.getNavigation().stop();
-            mob.getMoveControl().setWantedPosition(mob.getX(), mob.getY(), mob.getZ(), 0.0);
-            mob.getLookControl().setLookAt(nx, ny + 0.5, nz);
-
-            // One crest jump only if still clearly below the lip
-            boolean needCrest = needUp > 0.28 && mob.onGround();
-            if (needCrest) {
-                mob.getJumpControl().jump();
-            }
-
-            // Controlled horizontal entry based on normal mob speed, not a fixed launch.
-            double push = assistedHorizontalSpeed(mob, speed * 1.35, 0.12, 0.28);
-            double up;
-            if (needUp > 0.45) {
-                up = 0.5;
-            } else if (needUp > 0.15) {
-                up = needCrest ? 0.42 : Math.max(mob.getDeltaMovement().y, 0.12);
-            } else if (needUp < -0.15) {
-                up = Math.min(mob.getDeltaMovement().y, -0.05); // already high — settle in
-            } else {
-                up = Math.min(Math.max(mob.getDeltaMovement().y, 0.0), 0.12);
-            }
-
-            // Corner clip: hugging the wall beside the opening, a straight push at the
-            // node cuts the solid corner. Slide along the face toward an open neighbor
-            // cell that reduces distance to the hole instead.
-            if (mob.horizontalCollision && horiz > 1.1) {
-                BlockPos feet = mob.blockPosition();
-                double bestScore = Double.MAX_VALUE;
-                double bestX = dx, bestZ = dz;
-                int[][] dirs = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
-                for (int[] d : dirs) {
-                    BlockPos cand = feet.offset(d[0], 0, d[1]);
-                    if (isSolid(level, cand) || isSolid(level, cand.above())) {
-                        continue;
-                    }
-                    double cdx = nx - (cand.getX() + 0.5);
-                    double cdz = nz - (cand.getZ() + 0.5);
-                    double score = cdx * cdx + cdz * cdz;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        double len = Math.sqrt(cdx * cdx + cdz * cdz);
-                        if (len > 0.01) {
-                            bestX = cdx / len;
-                            bestZ = cdz / len;
-                        }
-                    }
-                }
-                dx = bestX;
-                dz = bestZ;
-            }
-
-            boolean headOpen = !isSolid(level, node.above());
-            if (headOpen) {
-                setAssistedVelocity(mob, dx * push, up, dz * push, push);
-            } else {
-                // Hold against the lip while clearing headroom; do not clip into it.
-                setAssistedVelocity(mob, dx * Math.min(push, 0.08),
-                        Math.max(mob.getDeltaMovement().y, 0.05),
-                        dz * Math.min(push, 0.08), 0.08);
-            }
-            mob.fallDistance = 0;
-
-
-            // If head is still blocked, clear it before advancing into the opening.
-            if (!headOpen && cached != null && cached.maxBreakHardness > 0) {
-                float h = level.getBlockState(node.above()).getDestroySpeed(level, node.above());
-                if (h >= 0 && h <= cached.maxBreakHardness) {
-                    MobBreakerHandler.tickBreaking(mob, node.above(), cached.maxBreakHardness);
-                    headOpen = !isSolid(level, node.above());
-                }
-            }
-
-            // Inside a fully open cell now — advance so the next node pulls through.
-            if (headOpen && needUp > -0.35 && needUp < 0.6 && horiz < 0.8) {
-                cached.advanceNode();
-            }
-
-            if (ChallengeMod.isAStarDebugEnabled() && mob.tickCount % 20 == 0) {
-                ChallengeMod.LOGGER.debug("[EnterHole] mob={} → {} needUp={} horiz={}",
-                        mob.getUUID().toString().substring(0, 4), node,
-                        String.format("%.2f", needUp), String.format("%.2f", horiz));
-            }
-            return;
-        }
-
-        // Vanilla navigation owns ordinary movement. Writing MoveControl as well causes
-        // double steering and makes 1.0x look like an external push.
-        mob.getNavigation().moveTo(nx, ny, nz, speed);
-        mob.getLookControl().setLookAt(nx, ny + 0.5, nz);
-
-        // Climb phase: only jump when meaningfully below (avoids lip bounce)
-        boolean climbNeeded = needUp > 0.9;
-        if (climbNeeded && (mob.onGround() || mob.horizontalCollision)) {
-            mob.getJumpControl().jump();
-            double push = assistedHorizontalSpeed(mob, speed, 0.10, 0.22);
-            double up = 0.38;
-            setAssistedVelocity(mob, dx * push, Math.max(mob.getDeltaMovement().y, up), dz * push, push);
-            if (ChallengeMod.isAStarDebugEnabled() && cached != null && mob.tickCount % 20 == 0) {
-                ChallengeMod.LOGGER.debug("[Climb] mob={} → {} needUp={}",
-                        mob.getUUID().toString().substring(0, 4), node,
-                        String.format("%.1f", needUp));
-            }
-        } else if (mob.horizontalCollision || (cached != null && cached.stuckTicks > 8)) {
-            double push = assistedHorizontalSpeed(mob, speed, 0.10, 0.22);
-            double ax = 0, az = 0;
-            BlockPos feet = mob.blockPosition();
-            if (isSolid(level, feet.north())) {
-                az += 1;
-            }
-            if (isSolid(level, feet.south())) {
-                az -= 1;
-            }
-            if (isSolid(level, feet.west())) {
-                ax += 1;
-            }
-            if (isSolid(level, feet.east())) {
-                ax -= 1;
-            }
-            double alen = Math.sqrt(ax * ax + az * az);
-            if (alen > 0) {
-                ax = ax / alen * 0.1;
-                az = az / alen * 0.1;
-            }
-            double vy = mob.getDeltaMovement().y;
-            if (climbNeeded) {
-                if (mob.onGround()) {
-                    mob.getJumpControl().jump();
-                }
-                vy = Math.max(vy, 0.32);
-            } else if (needUp > 0.2 && needUp <= 0.9 && mob.onGround()) {
-                // Single step-up toward hole, not spam
-                mob.getJumpControl().jump();
-                vy = Math.max(vy, 0.28);
-                push = 0.34;
-            }
-            setAssistedVelocity(mob, dx * push + ax, vy, dz * push + az, Math.min(0.24, push + 0.06));
-        } else if (climbNeeded && !mob.onGround()) {
-            double push = assistedHorizontalSpeed(mob, speed * 0.65, 0.06, 0.14);
-            setAssistedVelocity(mob,
-                    mob.getDeltaMovement().x * 0.55 + dx * push,
-                    mob.getDeltaMovement().y,
-                    mob.getDeltaMovement().z * 0.55 + dz * push,
-                    0.20);
-        }
+        // Reach this climb node before steering toward the next one; looking ahead
+        // can pull a mob away from the pillar before it has gained enough height.
+        HuntMovement.moveToPathNode(mob, node, speed);
+        mob.getLookControl().setLookAt(node.getX() + 0.5, node.getY() + 0.5, node.getZ() + 0.5);
+        HuntMovement.assistPathClimb(mob, node);
     }
 
     /** Execute a downward edge already validated by the main A* search. */
@@ -1409,7 +1228,9 @@ public class MobPathManager {
             boolean mobGriefing, long currentTick) {
         Level level = mob.level();
         BlockPos feet = mob.blockPosition();
-        if (landing.getY() >= feet.getY() || !level.isInWorldBounds(landing) || !level.hasChunkAt(landing)) {
+        if (landing.getY() >= feet.getY()
+                || landing.getX() != feet.getX() || landing.getZ() != feet.getZ()
+                || !level.isInWorldBounds(landing) || !level.hasChunkAt(landing)) {
             return false;
         }
 
@@ -1433,9 +1254,6 @@ public class MobPathManager {
             }
             if (currentTick - cached.lastBreakTick >= BREAK_COOLDOWN_TICKS) {
                 MobBreakerHandler.tickBreaking(mob, blocked, cached.maxBreakHardness);
-                if (hardness <= 3.0f) {
-                    MobBreakerHandler.tickBreaking(mob, blocked, cached.maxBreakHardness);
-                }
                 cached.lastBreakTick = currentTick;
                 registerBreach(level, blocked);
             }
@@ -1444,23 +1262,9 @@ public class MobPathManager {
             return true;
         }
 
-        // A* selected a standable, non-dangerous landing. Center over the shaft and fall.
-        double nx = landing.getX() + 0.5;
-        double nz = landing.getZ() + 0.5;
-        double dx = nx - mob.getX();
-        double dz = nz - mob.getZ();
-        double horizontal = Math.sqrt(dx * dx + dz * dz);
-        if (horizontal > 0.02) {
-            dx /= horizontal;
-            dz /= horizontal;
-        }
-        double pull = horizontal > 0.35
-                ? assistedHorizontalSpeed(mob, ChallengeMod.getSpeedMultiplier(), 0.08, 0.16)
-                : 0.04;
-        mob.getNavigation().stop();
-        mob.getMoveControl().setWantedPosition(nx, landing.getY(), nz, ChallengeMod.getSpeedMultiplier());
-        mob.setNoGravity(false);
-        setAssistedVelocity(mob, dx * pull, Math.min(mob.getDeltaMovement().y, -0.35), dz * pull, pull);
+        // Center using vanilla steering and let normal gravity execute the drop.
+        HuntMovement.moveTowards(mob, landing.getX() + 0.5, landing.getY(),
+                landing.getZ() + 0.5, ChallengeMod.getSpeedMultiplier());
         return true;
     }
 
@@ -1471,6 +1275,10 @@ public class MobPathManager {
         }
         float hardness = state.getDestroySpeed(level, pos);
         return hardness >= 0 && hardness <= maxHardness;
+    }
+
+    private static boolean isVerticalDrop(BlockPos from, BlockPos to) {
+        return to.getY() < from.getY() && to.getX() == from.getX() && to.getZ() == from.getZ();
     }
 
     private static int pathMaxY(List<BlockPos> path) {
@@ -1505,22 +1313,22 @@ public class MobPathManager {
             float feet = blockHardnessIfSolid(level, node);
             float head = blockHardnessIfSolid(level, node.above());
             maxH = Math.max(maxH, Math.max(feet, head));
-            if (feet > 0f || head > 0f) {
+            if (feet >= 0f || head >= 0f) {
                 anyBreak = true;
             }
             // Dig-down: next node is lower → floor(s) under this node must be broken
-            if (i + 1 < path.size() && path.get(i + 1).getY() < node.getY()) {
+            if (i + 1 < path.size() && isVerticalDrop(node, path.get(i + 1))) {
                 int drop = node.getY() - path.get(i + 1).getY();
                 for (int d = 1; d <= drop; d++) {
                     float floorH = blockHardnessIfSolid(level, node.below(d));
-                    if (floorH > 0f) {
+                    if (floorH >= 0f) {
                         anyBreak = true;
                         maxH = Math.max(maxH, floorH);
                     }
                 }
             }
         }
-        if (!anyBreak || maxH <= 0f) {
+        if (!anyBreak) {
             return "Standard";
         }
         if (maxH <= 3.0f) {
@@ -1535,11 +1343,11 @@ public class MobPathManager {
     private static float blockHardnessIfSolid(Level level, BlockPos pos) {
         BlockState state = level.getBlockState(pos);
         if (!state.blocksMotion()) {
-            return 0f;
+            return -1f;
         }
         float h = state.getDestroySpeed(level, pos);
         // Ignore unbreakable for classification (was wrongly labeling dig paths as HardBreak)
-        return h < 0 ? 0f : h;
+        return h;
     }
 
     private static void publishDebugPath(Mob mob, List<BlockPos> path) {
@@ -1623,9 +1431,16 @@ public class MobPathManager {
         breachGeneration = 0;
         sharedFreeRoute = null;
         lastMetadataCleanupTick = Long.MIN_VALUE;
+        lastTick = Long.MIN_VALUE;
+        pathCalcsPerTick = 0;
+        lastOpenHoleBumpMs = 0;
     }
 
     public static CachedMobPath getCachedPath(Mob mob) {
         return pathCache.get(mob.getUUID());
+    }
+
+    public static void invalidatePath(Mob mob) {
+        clearMobState(mob);
     }
 }

@@ -1,6 +1,7 @@
 package com.example.ai;
 
 import net.minecraft.core.BlockPos;
+import com.example.ChallengeMod;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,6 +26,9 @@ public class BuildPlanData {
      * Set the build plan for a mob
      */
     public static void setBuildPlan(UUID mobId, List<BlockPos> plan) {
+        if (!ChallengeMod.isAStarDebugEnabled()) {
+            return;
+        }
         if (plan == null || plan.isEmpty()) {
             removeBuildPlan(mobId);
             return;

@@ -31,6 +31,10 @@ loom {
 }
 
 dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.mockito:mockito-core:5.14.2'
+
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
 	mappings loom.officialMojangMappings()
@@ -87,4 +91,25 @@ publishing {
 		// The repositories here will be used for publishing your artifact, not for
 		// retrieving dependencies.
 	}
+}
+// Run regression tests on the same Java version supported by Minecraft 1.21.
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    workingDir = layout.buildDirectory.dir('test-runtime').get().asFile
+    doFirst {
+        workingDir.mkdirs()
+    }
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+// Opt-in physics integration tests in an isolated server world.
+if (project.hasProperty('gameTests')) {
+    fabricApi.configureTests {
+        createSourceSet = true
+        modId = 'challengecraft-test'
+        enableClientGameTests = false
+    }
+    loom.runs.gameTest.runDir = 'build/gametest-runtime'
 }

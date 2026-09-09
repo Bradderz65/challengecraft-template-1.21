@@ -10,6 +10,7 @@ import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -33,7 +34,7 @@ public class ChallengeMod implements ModInitializer {
 	private static volatile TargetMode targetMode = TargetMode.FAST;
 	private static volatile boolean challengeActive = true;
 	private static volatile boolean challengeLocked;
-	private static volatile int pendingActivationTicks;
+	private static volatile long pendingActivationTicks;
 	private static volatile boolean pendingLock;
 	private static volatile double speedMultiplier = 1.0D;
 	private static volatile boolean benchmarkOverride = false;
@@ -139,6 +140,10 @@ public class ChallengeMod implements ModInitializer {
 
 	public static void setAStarDebugEnabled(boolean enabled) {
 		aStarDebugEnabled = enabled;
+		if (!enabled) {
+			com.example.ai.PathDebugData.clearAll();
+			com.example.ai.BuildPlanData.clearAll();
+		}
 	}
 
 	@Override
@@ -151,10 +156,24 @@ public class ChallengeMod implements ModInitializer {
 		// Register authoritative multiplayer configuration and anti-tower behavior
 		ConfigNetworking.register();
 		AntiTowerHandler.register();
+		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+			AntiTowerHandler.clearAll();
+			MobPathManager.clearAll();
+			MobBreakerHandler.clearAll();
+			pendingActivationTicks = 0;
+			pendingLock = false;
+			challengeLocked = false;
+			benchmarkOverride = false;
+			lastTickTime = 0;
+			tickTimeIndex = 0;
+			tickTimeSamples = 0;
+			currentTps = 20.0;
+		});
 
 		ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
 			if (entity instanceof net.minecraft.world.entity.Mob mob) {
 				MobPathManager.onMobRemoved(mob);
+				MobBreakerHandler.onMobRemoved(mob);
 			}
 		});
 
@@ -194,7 +213,7 @@ public class ChallengeMod implements ModInitializer {
 			dispatcher.register(Commands.literal("challenge")
 					.requires(source -> source.hasPermission(2))
 					.then(Commands.literal("speed")
-							.then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.1D))
+							.then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.1D, 10.0D))
 									.executes(context -> setSpeedMultiplier(context.getSource(),
 											DoubleArgumentType.getDouble(context, "multiplier"))))));
 
@@ -207,6 +226,9 @@ public class ChallengeMod implements ModInitializer {
 		});
 
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			if (server.getTickCount() % 20 == 0) {
+				MobBreakerHandler.cleanupExpiredDamage(server);
+			}
 			// Track TPS
 			long now = System.nanoTime();
 			if (lastTickTime != 0) {
@@ -296,7 +318,7 @@ public class ChallengeMod implements ModInitializer {
 	}
 
 	private static void startChallengeInternal(int seconds, boolean lock) {
-		int delayTicks = Math.max(0, seconds) * 20;
+		long delayTicks = Math.max(0L, seconds) * 20L;
 		pendingActivationTicks = delayTicks;
 		pendingLock = lock;
 		challengeActive = delayTicks == 0;

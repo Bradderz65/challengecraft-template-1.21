@@ -6,6 +6,7 @@
 		"CreeperInvoker",
 		"CreeperExplodeMixin",
 		"LivingEntityMixin",
+		"EntityPushMixin",
 		"MobEntityMixin",
 		"BlockItemMixin",
 		"ProjectileMixin",

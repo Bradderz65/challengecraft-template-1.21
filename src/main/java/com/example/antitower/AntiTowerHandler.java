@@ -130,10 +130,14 @@ public class AntiTowerHandler {
         BlockPos playerPos = player.blockPosition();
 
         // Check blocks directly below the player (same X, Z)
-        for (int y = playerPos.getY() - 1; y > player.level().getMinBuildHeight(); y--) {
+        for (int y = playerPos.getY() - 1; y >= player.level().getMinBuildHeight(); y--) {
             BlockPos checkPos = new BlockPos(playerPos.getX(), y, playerPos.getZ());
 
             if (placedBlocks.contains(new DimPos(dimension, checkPos))) {
+                if (player.level().getBlockState(checkPos).isAir()) {
+                    removeBlockOwnership(player.level(), checkPos);
+                    break;
+                }
                 tower.add(checkPos);
             } else {
                 // Hit a non-player block, stop checking
@@ -165,6 +169,7 @@ public class AntiTowerHandler {
             return;
         }
 
+        removeBlockOwnership(player.level(), pos);
         UUID playerId = player.getUUID();
         Set<DimPos> placedBlocks = playerPlacedBlocks.computeIfAbsent(playerId,
                 k -> ConcurrentHashMap.newKeySet());
@@ -209,7 +214,7 @@ public class AntiTowerHandler {
         towerDetectedTime.clear();
     }
 
-    private static void removeBlockOwnership(Level level, BlockPos pos) {
+    public static void removeBlockOwnership(Level level, BlockPos pos) {
         DimPos dimPos = new DimPos(level.dimension(), pos.immutable());
         UUID owner = blockOwners.remove(dimPos);
         if (owner == null) {

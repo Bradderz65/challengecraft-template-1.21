@@ -1,48 +1,43 @@
 package com.example.ai;
 
+import com.example.ChallengeMod;
 import net.minecraft.core.BlockPos;
-import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Handles mob block placement to reach elevated targets.
- * Mobs build pillars that they can climb using wall-climbing mechanics.
- */
+/** Fallback scaffold building only after a route search fails to reach an elevated player. */
 public class MobBuilderHandler {
-
-    // Track building progress per mob
     private static final Map<UUID, BuildingState> buildingStates = new ConcurrentHashMap<>();
-
-    // Block placement delay (ticks between each block placed) - 20 ticks = 1 second
+    private record BuildTarget(ResourceKey<Level> dimension, UUID player) {}
+    private static final Map<BuildTarget, UUID> activeBuilders = new HashMap<>();
+    private static final Map<UUID, Long> retryAfter = new HashMap<>();
     private static final int PLACEMENT_DELAY = 20;
-
-    // How close mob must be to place a block (3 blocks)
     private static final double PLACEMENT_RANGE_SQ = 9.0;
-
-    // Maximum pillar height to build
     private static final int MAX_PILLAR_HEIGHT = 30;
+    private static final int BLOCKED_TIMEOUT = 100;
+    private static final int[][] SIDES = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
-    /**
-     * State of a mob's building progress
-     */
     public static class BuildingState {
         public final List<BlockPos> blocksToPlace;
+        public final BlockPos lockedTargetPos;
         public int currentIndex;
-        public int ticksSinceLastPlace;
-        public final BlockPos lockedTargetPos; // Locked target - doesn't change while building
+        public long lastPlaceTick = Long.MIN_VALUE;
+        public long lastProgressTick;
+        public double bestDistance = Double.POSITIVE_INFINITY;
+        private BuildTarget claim;
+        public long nextRouteCheckTick;
 
-        public BuildingState(List<BlockPos> blocksToPlace, BlockPos targetPos) {
-            this.blocksToPlace = blocksToPlace;
-            this.currentIndex = 0;
-            this.ticksSinceLastPlace = PLACEMENT_DELAY; // Start ready to place
-            this.lockedTargetPos = targetPos;
+        public BuildingState(List<BlockPos> plan, BlockPos targetPos) {
+            blocksToPlace = List.copyOf(plan);
+            lockedTargetPos = targetPos.immutable();
         }
 
         public boolean isComplete() {
@@ -50,244 +45,250 @@ public class MobBuilderHandler {
         }
 
         public BlockPos getNextBlock() {
-            if (currentIndex >= blocksToPlace.size())
-                return null;
-            return blocksToPlace.get(currentIndex);
+            return isComplete() ? null : blocksToPlace.get(currentIndex);
         }
     }
 
-    /**
-     * Check if a mob is currently building
-     */
     public static boolean isBuilding(Mob mob) {
         BuildingState state = buildingStates.get(mob.getUUID());
         return state != null && !state.isComplete();
     }
 
-    /**
-     * Start building toward a target position
-     */
     public static void startBuilding(Mob mob, BlockPos targetPos) {
-        if (mob.level().isClientSide)
-            return;
-
-        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING))
-            return;
-
-        // If already building, don't restart unless explicitly cancelled
-        if (isBuilding(mob)) {
+        if (mob.level().isClientSide || isBuilding(mob)
+                || mob.level().getGameTime() < retryAfter.getOrDefault(mob.getUUID(), Long.MIN_VALUE)
+                || !mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING)) {
+            HuntDiagnostics.decision(mob, "pillar_start", "active_cooldown_or_griefing_disabled");
             return;
         }
-
-        List<BlockPos> plan = calculatePillarPlan(mob, targetPos);
-        if (plan.isEmpty())
+        BuildTarget claim = new BuildTarget(mob.level().dimension(),
+                mob.getTarget() != null ? mob.getTarget().getUUID() : mob.getUUID());
+        if (activeBuilders.containsKey(claim)) {
+            HuntDiagnostics.decision(mob, "pillar_start", "another_builder_assigned");
             return;
-
+        }
+        if (MobPathManager.checkPillarRoute(mob, targetPos) != MobPathManager.PillarRouteStatus.MISSING) {
+            return;
+        }
+        List<BlockPos> plan = calculatePillarPlan(mob, targetPos);
+        if (plan.isEmpty()) {
+            HuntDiagnostics.decision(mob, "pillar_start", "no_scaffold_plan");
+            return;
+        }
+        MobPathManager.invalidatePath(mob);
         BuildingState state = new BuildingState(plan, targetPos);
+        state.lastProgressTick = mob.level().getGameTime();
+        state.nextRouteCheckTick = state.lastProgressTick + PLACEMENT_DELAY;
+        state.claim = claim;
         buildingStates.put(mob.getUUID(), state);
-
-        // Sync to clients for debug rendering
+        activeBuilders.put(claim, mob.getUUID());
         BuildPlanData.setBuildPlan(mob.getUUID(), plan);
+        log(mob, "started", plan.getFirst());
     }
 
-    /**
-     * Calculate a pillar build plan to reach an elevated target.
-     * Always builds DIRECTLY under the target position.
-     */
     public static List<BlockPos> calculatePillarPlan(Mob mob, BlockPos targetPos) {
         Level level = mob.level();
         BlockPos mobPos = mob.blockPosition();
-
-        // Only build if target is significantly above us
-        int heightDiff = targetPos.getY() - mobPos.getY();
-        if (heightDiff < 3) {
+        if (targetPos.getY() - mobPos.getY() < 3) {
             return Collections.emptyList();
         }
-
-        // Always build directly under target
-        BlockPos pillarBase = findGroundPos(level, new BlockPos(targetPos.getX(), targetPos.getY(), targetPos.getZ()));
-
-        if (pillarBase == null) {
+        BlockPos base = findGroundPos(level, new BlockPos(targetPos.getX(), mobPos.getY(), targetPos.getZ()));
+        if (base == null) {
             return Collections.emptyList();
         }
-
-        // Calculate blocks needed for the pillar
         List<BlockPos> plan = new ArrayList<>();
-        int targetHeight = targetPos.getY() - 1; // One below target so they can climb onto platform
-
-        for (int y = pillarBase.getY(); y <= targetHeight && plan.size() < MAX_PILLAR_HEIGHT; y++) {
-            BlockPos pos = new BlockPos(targetPos.getX(), y, targetPos.getZ());
-            BlockState state = level.getBlockState(pos);
-
-            // Only add if position is air
-            if (state.isAir()) {
+        int top = Math.min(targetPos.getY() - 1, base.getY() + MAX_PILLAR_HEIGHT - 1);
+        for (int y = base.getY(); y <= top; y++) {
+            BlockPos pos = new BlockPos(base.getX(), y, base.getZ());
+            if (!level.isInWorldBounds(pos)) {
+                break;
+            }
+            if (level.getBlockState(pos).canBeReplaced()) {
                 plan.add(pos);
             }
         }
-
         return plan;
     }
 
-    /**
-     * Find the ground level at a position
-     */
-    @SuppressWarnings("deprecation")
     private static BlockPos findGroundPos(Level level, BlockPos pos) {
-        // Scan down to find solid ground
-        for (int y = pos.getY(); y > level.getMinBuildHeight(); y--) {
-            BlockPos checkPos = new BlockPos(pos.getX(), y, pos.getZ());
-            BlockState below = level.getBlockState(checkPos.below());
-
-            if (below.blocksMotion() && !below.liquid()) {
-                return checkPos;
+        if (!level.isInWorldBounds(pos) || !level.hasChunkAt(pos)) {
+            return null;
+        }
+        // A local fallback must not scan hundreds of blocks below a distant target.
+        int bottom = Math.max(level.getMinBuildHeight() + 1, pos.getY() - MAX_PILLAR_HEIGHT);
+        for (int y = pos.getY(); y >= bottom; y--) {
+            BlockPos candidate = new BlockPos(pos.getX(), y, pos.getZ());
+            if (level.getBlockState(candidate.below()).blocksMotion()) {
+                return candidate;
             }
         }
         return null;
     }
 
-    /**
-     * Tick the building process for a mob.
-     * Returns true if mob is actively building (should stop moving).
-     */
+    /** Keep approaching/climbing while waiting to place, even when vanilla navigation fails. */
     public static boolean tickBuilding(Mob mob, BlockPos targetPos) {
-        if (mob.level().isClientSide)
+        Level level = mob.level();
+        BuildingState state = buildingStates.get(mob.getUUID());
+        if (level.isClientSide || state == null) {
             return false;
-
-        if (!mob.level().getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING)) {
+        }
+        if (!level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING)
+                || state.lockedTargetPos.distSqr(targetPos) > 25 || state.isComplete()) {
+            cancelBuilding(mob);
+            return false;
+        }
+        long tick = level.getGameTime();
+        if (MobPathManager.hasKnownRoute(mob, targetPos)) {
+            log(mob, "route_found", targetPos);
+            cancelBuilding(mob);
+            return false;
+        }
+        if (tick >= state.nextRouteCheckTick) {
+            MobPathManager.PillarRouteStatus route = MobPathManager.checkPillarRoute(mob, targetPos);
+            if (route == MobPathManager.PillarRouteStatus.FOUND) {
+                log(mob, "route_found", targetPos);
+                cancelBuilding(mob);
+                return false;
+            }
+            // A search slot is required before any more terrain modification.
+            if (route == MobPathManager.PillarRouteStatus.MISSING) {
+                state.nextRouteCheckTick = tick + PLACEMENT_DELAY;
+            }
+        }
+        BlockPos next = state.getNextBlock();
+        double distance = mob.blockPosition().distSqr(next);
+        if (distance + 1.0 < state.bestDistance) {
+            state.bestDistance = distance;
+            state.lastProgressTick = tick;
+        }
+        if (!level.hasChunkAt(next) || tick - state.lastProgressTick > BLOCKED_TIMEOUT) {
+            log(mob, "blocked_or_unloaded", next);
             cancelBuilding(mob);
             return false;
         }
 
-        UUID mobId = mob.getUUID();
-        BuildingState state = buildingStates.get(mobId);
-
-        // No active build state
-        if (state == null) {
-            return false;
-        }
-
-        // Check if building is complete
-        if (state.isComplete()) {
-            buildingStates.remove(mobId);
-            BuildPlanData.removeBuildPlan(mobId);
-            return false;
-        }
-
-        // Increment tick counter
-        state.ticksSinceLastPlace++;
-
-        // Check if enough time has passed to place a block
-        if (state.ticksSinceLastPlace < PLACEMENT_DELAY) {
-            // Still waiting - mob should move toward pillar
-            BlockPos nextBlock = state.getNextBlock();
-            if (nextBlock != null) {
-                mob.getNavigation().moveTo(
-                        nextBlock.getX() + 0.5,
-                        nextBlock.getY(),
-                        nextBlock.getZ() + 0.5,
-                        1.0);
-            }
+        // Approach BESIDE the pillar, not inside the block we are about to place.
+        BlockPos approach = findApproach(mob, next);
+        if (approach == null) {
+            if (mob.tickCount % 100 == 0) HuntDiagnostics.decision(mob, "pillar", "no_clear_approach");
             return true;
         }
+        HuntMovement.moveTowards(mob, approach.getX() + 0.5, mob.getY(),
+                approach.getZ() + 0.5, ChallengeMod.getSpeedMultiplier());
+        HuntMovement.assistVerticalClimb(mob, next.getY());
+        mob.getLookControl().setLookAt(next.getX() + 0.5, next.getY() + 0.5, next.getZ() + 0.5);
 
-        BlockPos nextBlock = state.getNextBlock();
-        if (nextBlock == null) {
-            buildingStates.remove(mobId);
-            BuildPlanData.removeBuildPlan(mobId);
-            return false;
+        if (mob.tickCount % 20 == 0 && ChallengeMod.isAStarDebugEnabled()) {
+            BuildPlanData.setBuildPlan(mob.getUUID(),
+                    state.blocksToPlace.subList(state.currentIndex, state.blocksToPlace.size()));
         }
-
-        // Check if mob is close enough to place the block
-        double distSq = mob.blockPosition().distSqr(nextBlock);
-
-        // Refresh debug plan every second to prevent expiry while moving
-        if (mob.tickCount % 20 == 0) {
-            List<BlockPos> remaining = state.blocksToPlace.subList(
-                    state.currentIndex,
-                    state.blocksToPlace.size());
-            BuildPlanData.setBuildPlan(mobId, remaining);
-        }
-
-        if (distSq > PLACEMENT_RANGE_SQ) {
-            // Mob needs to move closer - reset timer until in range
-            state.ticksSinceLastPlace = 0;
-            mob.getNavigation().moveTo(
-                    nextBlock.getX() + 0.5,
-                    nextBlock.getY(),
-                    nextBlock.getZ() + 0.5,
-                    1.0);
+        BlockState current = level.getBlockState(next);
+        if (current.blocksMotion()) {
+            // Another mob completed this step for us.
+            advance(mob, state, tick);
             return true;
         }
-
-        // Place the block
-        ServerLevel serverLevel = (ServerLevel) mob.level();
-        BlockState currentState = serverLevel.getBlockState(nextBlock);
-
-        if (currentState.isAir()) {
-            // Place cobblestone
-            serverLevel.setBlock(nextBlock, Blocks.COBBLESTONE.defaultBlockState(), 3);
-
-            // Advance to next block
-            state.currentIndex++;
-            state.ticksSinceLastPlace = 0;
-
-            // Update debug data with remaining blocks
-            if (!state.isComplete()) {
-                List<BlockPos> remaining = state.blocksToPlace.subList(
-                        state.currentIndex,
-                        state.blocksToPlace.size());
-                BuildPlanData.setBuildPlan(mobId, remaining);
-            } else {
-                BuildPlanData.removeBuildPlan(mobId);
-            }
+        if (mob.blockPosition().distSqr(next) > PLACEMENT_RANGE_SQ
+                || (state.lastPlaceTick != Long.MIN_VALUE && tick - state.lastPlaceTick < PLACEMENT_DELAY)) {
+            return true;
+        }
+        // Only place on the tick that verified there is still no complete route.
+        if (state.nextRouteCheckTick != tick + PLACEMENT_DELAY) {
+            state.nextRouteCheckTick = tick;
+            return true;
+        }
+        if (tryPlaceScaffold(mob, next)) {
+            state.lastPlaceTick = tick;
+            advance(mob, state, tick);
         } else {
-            // Block already occupied, skip it
-            state.currentIndex++;
-            state.ticksSinceLastPlace = 0;
+            HuntDiagnostics.decision(mob, "pillar", "placement_rejected");
         }
-
-        // Look at where we're building
-        mob.getLookControl().setLookAt(
-                nextBlock.getX() + 0.5,
-                nextBlock.getY() + 0.5,
-                nextBlock.getZ() + 0.5);
-
         return true;
     }
 
-    /**
-     * Check if a mob should be building (path failed and target is above)
-     */
-    public static boolean shouldBuild(Mob mob, BlockPos targetPos, boolean pathFailed) {
-        if (!pathFailed)
+    private static void advance(Mob mob, BuildingState state, long tick) {
+        state.currentIndex++;
+        state.lastProgressTick = tick;
+        state.bestDistance = Double.POSITIVE_INFINITY;
+        if (state.isComplete()) {
+            log(mob, "completed", state.lockedTargetPos);
+            cancelBuilding(mob);
+        }
+    }
+
+    public static boolean hasPendingRouteCheck(long tick) {
+        for (BuildingState state : buildingStates.values()) {
+            if (tick >= state.nextRouteCheckTick) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static BlockPos findApproach(Mob mob, BlockPos pillar) {
+        Level level = mob.level();
+        BlockPos best = null;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        for (int[] side : SIDES) {
+            BlockPos pos = new BlockPos(pillar.getX() + side[0], mob.blockPosition().getY(),
+                    pillar.getZ() + side[1]);
+            if (!level.isInWorldBounds(pos) || !level.hasChunkAt(pos)
+                    || level.getBlockState(pos).blocksMotion() || level.getBlockState(pos.above()).blocksMotion()) {
+                continue;
+            }
+            double distance = mob.blockPosition().distSqr(pos);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = pos;
+            }
+        }
+        return best;
+    }
+
+    public static boolean shouldBuild(Mob mob, BlockPos targetPos, boolean needsRouteCheck) {
+        return needsRouteCheck && targetPos.getY() - mob.blockPosition().getY() >= 3;
+    }
+
+    public static boolean tryPlaceScaffold(Mob mob, BlockPos pos) {
+        Level level = mob.level();
+        BlockState scaffold = Blocks.COBBLESTONE.defaultBlockState();
+        if (level.isClientSide || !level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING)
+                || !level.isInWorldBounds(pos) || !level.hasChunkAt(pos)
+                || !level.getBlockState(pos).canBeReplaced()
+                || !level.isUnobstructed(scaffold, pos, CollisionContext.empty())) {
             return false;
-
-        int heightDiff = targetPos.getY() - mob.blockPosition().getY();
-        return heightDiff >= 3;
+        }
+        if (!level.setBlock(pos, scaffold, 3)) {
+            return false;
+        }
+        MobPathManager.registerMobPlacedBlock(level, pos);
+        return true;
     }
 
-    /**
-     * Clean up when a mob is removed
-     */
+    private static void log(Mob mob, String reason, BlockPos pos) {
+        if (ChallengeMod.isAStarDebugEnabled()) {
+            ChallengeMod.LOGGER.info("[Pillar] mob={} reason={} pos={}", mob.getUUID(), reason, pos);
+        }
+    }
+
     public static void onMobRemoved(Mob mob) {
-        buildingStates.remove(mob.getUUID());
-        BuildPlanData.removeBuildPlan(mob.getUUID());
+        cancelBuilding(mob);
+        retryAfter.remove(mob.getUUID());
     }
 
-    /**
-     * Clear all building states
-     */
     public static void clearAll() {
         buildingStates.clear();
+        activeBuilders.clear();
+        retryAfter.clear();
         BuildPlanData.clearAll();
     }
 
-    /**
-     * Cancel building for a mob (used when path is found)
-     */
     public static void cancelBuilding(Mob mob) {
-        buildingStates.remove(mob.getUUID());
+        BuildingState state = buildingStates.remove(mob.getUUID());
+        if (state != null) {
+            activeBuilders.remove(state.claim, mob.getUUID());
+            retryAfter.put(mob.getUUID(), mob.level().getGameTime() + 100);
+        }
         BuildPlanData.removeBuildPlan(mob.getUUID());
     }
-
 }

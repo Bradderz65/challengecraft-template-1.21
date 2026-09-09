@@ -36,6 +36,9 @@ public final class CachedMobPath {
     public long lastBuildLogTick;
     public BlockPos lastPos;
     public int stuckTicks;
+    private BlockPos progressNode;
+    private double bestNodeDistance = Double.POSITIVE_INFINITY;
+    private long lastProgressTick;
 
     public CachedMobPath(List<BlockPos> path, BlockPos targetPos, Map<BlockPos, BlockPos> buildActions,
             String strategy, boolean partial) {
@@ -54,21 +57,29 @@ public final class CachedMobPath {
         return switch (strategy) {
             case "Standard" -> 0.0f;
             case "SoftBreak" -> 3.0f;
-            case "MediumBreak", "Building" -> 10.0f;
-            case "HardBreak" -> Float.MAX_VALUE;
+            case "MediumBreak" -> 10.0f;
+            case "HardBreak", "Building" -> Float.MAX_VALUE;
             default -> MobBreakerHandler.DEFAULT_MAX_BREAK_HARDNESS;
         };
     }
 
     public void checkStuck(Mob mob, Player target) {
         BlockPos currentPos = mob.blockPosition();
-        if (!currentPos.equals(lastPos)) {
+        BlockPos nextNode = getNextNode();
+        long tick = mob.level().getGameTime();
+        var destination = nextNode == null ? null : HuntMovement.nodePosition(mob, nextNode);
+        double distance = destination == null ? 0 : mob.distanceToSqr(destination.x, destination.y, destination.z);
+        if (!java.util.Objects.equals(nextNode, progressNode) || tick < lastProgressTick
+                || distance + 0.04 < bestNodeDistance) {
             stuckTicks = 0;
             lastPos = currentPos;
+            progressNode = nextNode;
+            bestNodeDistance = distance;
+            lastProgressTick = tick;
             return;
         }
 
-        stuckTicks++;
+        stuckTicks = (int) Math.min(Integer.MAX_VALUE, tick - lastProgressTick);
         if (stuckTicks > 20 && stuckTicks % 100 == 0
                 && ChallengeMod.isAStarDebugEnabled() && mob.distanceTo(target) <= 20.0) {
             BlockPos next = getNextNode();
@@ -82,6 +93,19 @@ public final class CachedMobPath {
 
     public boolean isStuckLong() {
         return stuckTicks >= STUCK_REPLAN_TICKS;
+    }
+
+    public boolean hasFallenBehind(Mob mob) {
+        if (currentNodeIndex <= 0 || isComplete()) return false;
+        // Both endpoints must be above us: intentional downward edges remain valid.
+        return path.get(currentNodeIndex - 1).getY() - mob.getY() > 2.0
+                && getNextNode().getY() - mob.getY() > 2.0;
+    }
+
+    public boolean hasClimbedPast(Mob mob) {
+        if (currentNodeIndex <= 0 || isComplete() || getFinalNode().getY() <= mob.getY()) return false;
+        int previousY = path.get(currentNodeIndex - 1).getY();
+        return getNextNode().getY() >= previousY && mob.getY() - getNextNode().getY() > 2.0;
     }
 
     public List<BlockPos> remainingPath() {
@@ -108,8 +132,14 @@ public final class CachedMobPath {
                 best = i;
             }
         }
-        currentNodeIndex = Math.min(best + (bestDistance < 2.25 ? 1 : 0), path.size() - 1);
+        // The first cell of a freshly planned route is its origin. Requiring two
+        // colliding mobs to center on that same point can deadlock both at the base.
+        boolean atOrigin = best == 0 && path.size() > 1 && path.getFirst().equals(mobPos);
+        currentNodeIndex = Math.min(best + (atOrigin || MobPathManager.hasArrivedAtNode(mob, path.get(best)) ? 1 : 0),
+                path.size() - 1);
         stuckTicks = 0;
+        progressNode = null;
+        bestNodeDistance = Double.POSITIVE_INFINITY;
         lastPos = mobPos;
     }
 

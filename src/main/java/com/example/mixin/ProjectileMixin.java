@@ -52,28 +52,7 @@ public abstract class ProjectileMixin {
         if (hardness >= MobBreakerHandler.ULTRA_HARD_THRESHOLD) {
             return;
         }
-        if (hardness <= 0) {
-            hardness = 0.5f;
-        }
-
-        // Meaningful chips: cobble (~2) ≈ 0.35 per hit → ~3 arrows; dirt faster
-        float damage = hardness <= 3.0f
-                ? (0.55f / Math.max(hardness, 0.4f))
-                : (0.28f / hardness);
-
-        MobBreakerHandler.applyDamage((ServerLevel) arrow.level(), pos, owner, damage);
-
-        // Soft walls: also chip the block toward the player if the hit is thick
-        if (hardness <= 3.0f) {
-            BlockPos inward = pos.relative(hitResult.getDirection().getOpposite());
-            if (!MobPathManager.isMobPlacedBlock(arrow.level(), inward)) {
-                BlockState inner = arrow.level().getBlockState(inward);
-                float h2 = inner.getDestroySpeed(arrow.level(), inward);
-                if (h2 >= 0 && h2 < MobBreakerHandler.ULTRA_HARD_THRESHOLD && h2 <= 3.0f) {
-                    float d2 = 0.35f / Math.max(h2, 0.4f);
-                    MobBreakerHandler.applyDamage((ServerLevel) arrow.level(), inward, owner, d2);
-                }
-            }
-        }
+        MobBreakerHandler.applyDamage((ServerLevel) arrow.level(), pos, owner,
+                MobBreakerHandler.arrowDamage(hardness));
     }
 }

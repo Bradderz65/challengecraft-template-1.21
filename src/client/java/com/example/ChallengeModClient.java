@@ -45,6 +45,11 @@ public class ChallengeModClient implements ClientModInitializer {
 							context.getSource().sendFeedback(Component.literal("§cBenchmark already in progress!"));
 							return 0;
 						}
+                        if (!context.getSource().getClient().hasSingleplayerServer()
+                                || !ChallengeMod.isChallengeActive()) {
+                            context.getSource().sendFeedback(Component.literal("Benchmark requires an active challenge in a local world."));
+                            return 0;
+                        }
 						startBenchmark(context.getSource().getClient());
 						return 1;
 					}));
@@ -73,9 +78,14 @@ public class ChallengeModClient implements ClientModInitializer {
 	}
 
 	private void onClientTick(Minecraft client) {
-		if (!benchmarkRunning || client.player == null) {
-			return;
-		}
+		if (client.player == null) {
+            benchmarkRunning = false;
+            ChallengeMod.setBenchmarkOverride(false);
+            return;
+        }
+        if (!benchmarkRunning) {
+            return;
+        }
 
 		// Collect FPS, frametime, and TPS data
 		float fps = client.getFps();

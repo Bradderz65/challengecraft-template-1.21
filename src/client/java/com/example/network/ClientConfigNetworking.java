@@ -2,6 +2,7 @@ package com.example.network;
 
 import com.example.config.ModConfig;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
 public final class ClientConfigNetworking {
     private static boolean serverSynced;
@@ -10,6 +11,10 @@ public final class ClientConfigNetworking {
     }
 
     public static void register() {
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            serverSynced = false;
+            ModConfig.load();
+        });
         ClientPlayNetworking.registerGlobalReceiver(ConfigPayload.TYPE, (payload, context) -> {
             payload.apply();
             serverSynced = true;

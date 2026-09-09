@@ -56,6 +56,8 @@ public class AStarPathfinder {
             { 1, 1, 1 }, { 1, 1, -1 }, { -1, 1, 1 }, { -1, 1, -1 }
     };
 
+    private static final int[][] JUMPS = { { 2, 0, 0 }, { -2, 0, 0 }, { 0, 0, 2 }, { 0, 0, -2 } };
+
     public static class PathNode {
         public final BlockPos pos;
         public double gCost;
@@ -208,6 +210,9 @@ public class AStarPathfinder {
             for (int[] dir : DIRECTIONS) {
                 BlockPos neighborPos = current.pos.offset(dir[0], dir[1], dir[2]);
 
+                if (!level.isInWorldBounds(neighborPos) || !level.hasChunkAt(neighborPos)) {
+                    continue;
+                }
                 if (isValidMove(level, current.pos, neighborPos, allowBreaking, maxHardness)) {
                     processNeighbor(current, neighborPos, level, openSet, closedSet, allNodes, target, false,
                             allowBreaking, null, maxHardness);
@@ -215,8 +220,7 @@ public class AStarPathfinder {
                     // Drop through air column to a standable landing
                     int dy = neighborPos.getY() - current.pos.getY();
                     if (dy <= 0 && dy >= -1
-                            && isPassable(level, neighborPos, allowBreaking, maxHardness)
-                            && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)
+                            && hasHeadroom(level, neighborPos, false, 0)
                             && !isDanger(level, neighborPos)) {
                         for (int i = 1; i <= 4; i++) {
                             BlockPos landing = neighborPos.below(i);
@@ -227,13 +231,14 @@ public class AStarPathfinder {
                                 break;
                             }
                             if (canStandAt(level, landing, allowBreaking, maxHardness)) {
-                                processNeighbor(current, landing, level, openSet, closedSet, allNodes, target,
-                                        false, allowBreaking, null, maxHardness);
+                                if (isValidMove(level, current.pos, landing, allowBreaking, maxHardness)) {
+                                    processNeighbor(current, landing, level, openSet, closedSet, allNodes, target,
+                                            false, allowBreaking, null, maxHardness);
+                                }
                                 break;
                             }
-                            BlockState s = level.getBlockState(landing);
-                            float hardness = s.getDestroySpeed(level, landing);
-                            if (s.blocksMotion() && (!allowBreaking || hardness < 0 || hardness > maxHardness)) {
+                            // Intermediate cells are not path nodes, so the executor cannot dig them.
+                            if (!isPassable(level, landing, false, 0)) {
                                 break;
                             }
                         }
@@ -244,6 +249,7 @@ public class AStarPathfinder {
                 if (allowBuilding) {
                     int dy = neighborPos.getY() - current.pos.getY();
                     if (dy == 0
+                            && Math.abs(dir[0]) + Math.abs(dir[2]) == 1
                             && isPassable(level, neighborPos, allowBreaking, maxHardness)
                             && hasHeadroom(level, neighborPos, allowBreaking, maxHardness)
                             && !isDanger(level, neighborPos)) {
@@ -280,8 +286,7 @@ public class AStarPathfinder {
 
             // Short jumps (disabled when building so bridges win)
             if (!allowBuilding) {
-                int[][] jumps = { { 2, 0, 0 }, { -2, 0, 0 }, { 0, 0, 2 }, { 0, 0, -2 } };
-                for (int[] jump : jumps) {
+                for (int[] jump : JUMPS) {
                     BlockPos jumpTarget = current.pos.offset(jump[0], jump[1], jump[2]);
                     BlockPos midPoint = current.pos.offset(jump[0] / 2, 0, jump[2] / 2);
                     if (isValidJump(level, current.pos, midPoint, jumpTarget, allowBreaking, maxHardness)) {
@@ -353,58 +358,35 @@ public class AStarPathfinder {
             return;
         }
 
-        double baseDig = digCost(level, floor, maxHardness);
-        boolean digTwo = false;
-        BlockPos floor2 = floor.below();
-        if (level.getBlockState(floor2).blocksMotion()) {
-            float h2 = level.getBlockState(floor2).getDestroySpeed(level, floor2);
-            if (h2 >= 0 && h2 <= maxHardness) {
-                baseDig += digCost(level, floor2, maxHardness);
-                digTwo = true;
-            }
-        }
-
-        int digDepth = digTwo ? 2 : 1;
-        double shaftDig = 0.0; // dig cost of solid cells passed through on the way down
-        for (int drop = digDepth; drop <= digDepth + 5; drop++) {
+        // Every shaft cell is charged once, including the first landing's feet.
+        double shaftDig = 0.0;
+        for (int drop = 1; drop <= 6; drop++) {
             BlockPos candidate = current.pos.below(drop);
-            if (!level.isInWorldBounds(candidate) || !level.hasChunkAt(candidate)) {
+            if (!level.isInWorldBounds(candidate) || !level.hasChunkAt(candidate)
+                    || isDanger(level, candidate) || isDanger(level, candidate.below())) {
                 break;
             }
-            if (isDanger(level, candidate) || isDanger(level, candidate.below())) {
-                break;
-            }
-
-            double feetDig = 0.0;
             BlockState feet = level.getBlockState(candidate);
             if (feet.blocksMotion()) {
-                float fh = feet.getDestroySpeed(level, candidate);
-                if (fh < 0 || fh > maxHardness) {
-                    break; // unbreakable cell blocks the shaft — no deeper landing reachable
+                float hardness = feet.getDestroySpeed(level, candidate);
+                if (hardness < 0 || hardness > maxHardness) {
+                    break;
                 }
-                feetDig = digCost(level, candidate, maxHardness);
+                shaftDig += digCost(level, candidate, maxHardness);
             }
-
             BlockState under = level.getBlockState(candidate.below());
             if (under.blocksMotion() || under.liquid()) {
                 processNeighborWithExtraCost(current, candidate, openSet, closedSet, allNodes, target,
-                        baseDig + shaftDig + feetDig + drop * DROP_PER_BLOCK, null);
+                        shaftDig + drop * DROP_PER_BLOCK, null);
                 break;
             }
-
-            // Keep falling — a solid cell here must be dug through before descending further
-            shaftDig += feetDig;
         }
     }
 
     private static void processNeighbor(PathNode current, BlockPos neighborPos, Level level,
             PriorityQueue<OpenEntry> openSet, Set<BlockPos> closedSet, Map<BlockPos, PathNode> allNodes,
             BlockPos target, boolean isJump, boolean allowBreaking, BlockPos buildBlock, float maxHardness) {
-        if (buildBlock == null && !isJump
-                && !isValidMove(level, current.pos, neighborPos, allowBreaking, maxHardness)) {
-            return;
-        }
-
+        // Each caller validates its edge once before calculating its cost.
         double moveCost = calculateMoveCost(level, current.pos, neighborPos, allowBreaking, maxHardness);
         if (isJump) {
             moveCost += JUMP_EXTRA;
@@ -459,8 +441,9 @@ public class AStarPathfinder {
                 || isDanger(level, end.below())) {
             return false;
         }
-        if (!isPassable(level, mid, allowBreaking, maxHardness)
-                || !hasHeadroom(level, mid, allowBreaking, maxHardness)) {
+        if (!hasHeadroom(level, mid, false, 0)
+                || !isPassable(level, start.above(2), false, 0)
+                || !isPassable(level, mid.above(2), false, 0)) {
             return false;
         }
         return !isDanger(level, mid) && !isDanger(level, mid.above());
@@ -517,6 +500,12 @@ public class AStarPathfinder {
             }
         }
 
+        if (dy > 0 && dx + dz > 0 && !level.getBlockState(from.below()).blocksMotion()) {
+            // Sideways travel while clinging takes additional time. Pricing it like
+            // a straight ascent made routes zigzag across walls at every height.
+            cost += dx == 1 && dz == 1 ? DIAGONAL_WALK_COST : WALK_COST;
+        }
+
         if (isDanger(level, to) || isDanger(level, to.below())) {
             cost += DANGER_COST;
         }
@@ -552,43 +541,21 @@ public class AStarPathfinder {
         }
 
         // Live progress from the swarm (0 = untouched, 1 = about to pop)
-        float progress = Math.max(
-                MobBreakerHandler.getBlockDamage(level, pos),
-                MobPathManager.getBreachProgress(level, pos));
+        float progress = MobPathManager.getBreachProgress(level, pos);
 
         // Base dig ticks ≈ inverse of MobBreakerHandler damage per hit
         double baseTicks = MobBreakerHandler.estimateTicksToBreak(hardness);
 
-        // Prefer soft materials slightly more (game design: dirt/cobble doors feel right)
-        if (hardness <= 0.6f) {
-            baseTicks *= 0.85;
-        } else if (hardness <= 3.0f) {
-            baseTicks *= 0.95;
-        }
-
-        // Don't casually smash our own scaffolds
+        // Cost reflects remaining work at the same solo rate used by the breaker.
+        // Swarm interest must not turn a hard wall into a virtually free route.
+        double remaining = baseTicks * (1.0 - progress);
         if (MobPathManager.isMobPlacedBlock(level, pos) && progress < 0.25f) {
-            baseTicks += 120.0;
+            remaining += 120.0;
         }
-
-        // Swarm magnet: remaining work scales with (1 - progress)^2
-        // 0% → full, 50% → 25%, 80% → 4%, 90% → ~1%
-        if (progress >= 0.85f) {
-            return 0.35; // almost free — pile on
-        }
-        if (progress >= MobBreakerHandler.SWARM_FOCUS_DAMAGE) {
-            double remain = 1.0 - progress;
-            return Math.max(0.5, baseTicks * remain * remain);
-        }
-        if (MobPathManager.isPlannedBreach(level, pos) && progress > 0.05f) {
-            // Someone committed; join them at a discount
-            return Math.max(1.0, baseTicks * (1.0 - progress * 0.7) * 0.65);
-        }
-
-        return baseTicks * (1.0 - progress * 0.9);
+        return Math.max(0.5, remaining);
     }
 
-    private static boolean isValidMove(Level level, BlockPos from, BlockPos to, boolean allowBreaking,
+    static boolean isValidMove(Level level, BlockPos from, BlockPos to, boolean allowBreaking,
             float maxHardness) {
         if (!level.isInWorldBounds(to) || !level.hasChunkAt(to)) {
             return false;
@@ -617,7 +584,8 @@ public class AStarPathfinder {
         boolean hasFloor = toBelow.blocksMotion() || toBelow.liquid();
         if (!hasFloor) {
             boolean nearWall = isNextToWall(level, to) || isNextToWall(level, from);
-            boolean climbUp = dy == 1 && nearWall;
+            boolean climbUp = dy == 1 && nearWall
+                    && (isNextToWall(level, to) || (dx == 0 && dz == 0));
             boolean hangStrafe = dy == 0 && nearWall && isNextToWall(level, to);
             if (!climbUp && !hangStrafe) {
                 return false;
@@ -628,15 +596,15 @@ public class AStarPathfinder {
         if (Math.abs(dx) == 1 && Math.abs(dz) == 1) {
             BlockPos check1 = from.offset(dx, 0, 0);
             BlockPos check2 = from.offset(0, 0, dz);
-            if (!isPassable(level, check1, allowBreaking, maxHardness)
-                    || !isPassable(level, check2, allowBreaking, maxHardness)) {
+            if (!hasHeadroom(level, check1, false, 0)
+                    || !hasHeadroom(level, check2, false, 0)) {
                 return false;
             }
             if (dy != 0) {
                 BlockPos check1Y = from.offset(dx, dy, 0);
                 BlockPos check2Y = from.offset(0, dy, dz);
-                if (!isPassable(level, check1Y, allowBreaking, maxHardness)
-                        || !isPassable(level, check2Y, allowBreaking, maxHardness)) {
+                if (!hasHeadroom(level, check1Y, false, 0)
+                        || !hasHeadroom(level, check2Y, false, 0)) {
                     return false;
                 }
                 if (isDanger(level, check1Y) || isDanger(level, check2Y)) {
@@ -649,6 +617,9 @@ public class AStarPathfinder {
         }
 
         if (dy == 1) {
+            if (!isPassable(level, from.above(2), false, 0)) {
+                return false;
+            }
             BlockState below = level.getBlockState(from.below());
             if (!below.blocksMotion() && !below.liquid() && !isNextToWall(level, from)) {
                 return false;
@@ -675,10 +646,13 @@ public class AStarPathfinder {
     }
 
     private static boolean isClimbableNeighbor(Level level, BlockPos pos) {
-        if (!level.getBlockState(pos).blocksMotion()) {
+        if (!level.isInWorldBounds(pos) || !level.hasChunkAt(pos)) {
             return false;
         }
-        return level.getBlockState(pos.above()).blocksMotion() || level.getBlockState(pos.below()).blocksMotion();
+        // A one-block platform edge can support the mob's body at head height.
+        // Requiring a stack of blocks strands climbers below thin floating decks.
+        return level.getBlockState(pos).blocksMotion()
+                || (level.hasChunkAt(pos.above()) && level.getBlockState(pos.above()).blocksMotion());
     }
 
     private static boolean hasHeadroom(Level level, BlockPos pos, boolean allowBreaking, float maxHardness) {
@@ -687,16 +661,14 @@ public class AStarPathfinder {
     }
 
     private static boolean isPassable(Level level, BlockPos pos, boolean allowBreaking, float maxHardness) {
+        if (!level.isInWorldBounds(pos) || !level.hasChunkAt(pos)) {
+            return false;
+        }
         BlockState state = level.getBlockState(pos);
         if (state.isPathfindable(PathComputationType.LAND) || !state.blocksMotion()) {
             return true;
         }
-        return allowBreaking && isBreakable(level, pos, maxHardness);
-    }
-
-    private static boolean isBreakable(Level level, BlockPos pos, float maxHardness) {
-        BlockState state = level.getBlockState(pos);
-        if (state.isAir()) {
+        if (!allowBreaking) {
             return false;
         }
         float h = state.getDestroySpeed(level, pos);
